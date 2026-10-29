@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: switchboard-channels
+  namespace: switchboard
+data:
+  channels.yaml: |
+    tenant_id: 00000000-0000-0000-0000-000000000000
+    alerts_channel: ops
+    channels:
+      ops:
+        description: Operations agent for the example product
+        team_id: "19:xxxxxxxx@thread.tacv2"
+        channel_id: "19:yyyyyyyy@thread.tacv2"
+        agent: { id: agent_xxx }
+        environment_id: env_xxx
+        vault_ids: [vlt_xxx]
+        resources:
+          - { type: memory_store, memory_store_id: memstore_xxx, access: read_write }
+        budget_usd: 10
+        session_title_prefix: Teams

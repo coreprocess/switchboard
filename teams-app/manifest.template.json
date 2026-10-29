@@ -1,0 +1,48 @@
+{
+    "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.19/MicrosoftTeams.schema.json",
+    "manifestVersion": "1.19",
+    "version": "{{VERSION}}",
+    "id": "{{APP_ID}}",
+    "developer": {
+        "name": "{{DEVELOPER_NAME}}",
+        "websiteUrl": "{{WEBSITE_URL}}",
+        "privacyUrl": "{{PRIVACY_URL}}",
+        "termsOfUseUrl": "{{TERMS_URL}}"
+    },
+    "name": {
+        "short": "{{NAME}}",
+        "full": "{{NAME}}"
+    },
+    "description": {
+        "short": "{{SHORT_DESCRIPTION}}",
+        "full": "{{FULL_DESCRIPTION}}"
+    },
+    "icons": {
+        "color": "color.png",
+        "outline": "outline.png"
+    },
+    "accentColor": "#2563EB",
+    "bots": [
+        {
+            "botId": "{{BOT_ID}}",
+            "scopes": ["team"],
+            "supportsFiles": false,
+            "isNotificationOnly": false
+        }
+    ],
+    "validDomains": [],
+    "webApplicationInfo": {
+        "id": "{{BOT_ID}}",
+        "resource": "https://RscBasedStoreApp"
+    },
+    "authorization": {
+        "permissions": {
+            "resourceSpecific": [
+                {
+                    "name": "ChannelMessage.Read.Group",
+                    "type": "Application"
+                }
+            ]
+        }
+    }
+}

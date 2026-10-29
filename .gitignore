@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+teams-app/build/
+*.log
+.DS_Store
+*.local.yaml

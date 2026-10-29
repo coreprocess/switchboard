@@ -1,0 +1,90 @@
+# Exactly one replica: Switchboard holds live session streams in memory. Recreate, so an old and a new pod never
+# run at the same time; the reconciler catches up on anything missed during the switch.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: switchboard
+  namespace: switchboard
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: switchboard
+  template:
+    metadata:
+      labels:
+        app: switchboard
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: switchboard
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: switchboard
+          image: ghcr.io/coreprocess/switchboard:0.1.0
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: SWITCHBOARD_CONFIG
+              value: /etc/switchboard/channels.yaml
+            - name: SWITCHBOARD_PUBLIC_URL
+              value: https://switchboard.example.com
+            - name: STORE_KIND
+              value: azure-tables
+            - name: STORE_TABLES_ENDPOINT
+              value: https://<storage account>.table.core.windows.net
+            - name: LOG_LEVEL
+              value: info
+            # Teams sign-in through workload identity: the bot's app registration, no secret.
+            - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHTYPE
+              value: WorkloadIdentity
+            - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID
+              value: "<bot app registration client id>"
+            - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID
+              value: "<tenant id>"
+            - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHORITY
+              value: https://login.microsoftonline.com/<tenant id>
+            - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__FEDERATEDTOKENFILE
+              value: /var/run/secrets/azure/tokens/azure-identity-token
+            - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__SCOPE
+              value: https://api.botframework.com
+          envFrom:
+            - secretRef:
+                name: switchboard
+          volumeMounts:
+            - name: channels
+              mountPath: /etc/switchboard
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ "ALL" ]
+      volumes:
+        - name: channels
+          configMap:
+            name: switchboard-channels

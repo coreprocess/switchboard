@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: switchboard
+  namespace: switchboard
+spec:
+  selector:
+    app: switchboard
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

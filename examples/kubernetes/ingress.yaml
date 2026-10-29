@@ -1,0 +1,25 @@
+# Public HTTPS is required: the Bot Framework, Claude webhooks and agent sandboxes (calling /mcp) reach it from
+# the internet. Long read timeouts are not needed: every inbound request is short.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: switchboard
+  namespace: switchboard
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [ switchboard.example.com ]
+      secretName: switchboard-tls
+  rules:
+    - host: switchboard.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: switchboard
+                port:
+                  name: http
