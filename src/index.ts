@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
-import Anthropic from '@anthropic-ai/sdk';
 import { WorkloadIdentityCredential } from '@azure/identity';
 import { loadAuthConfigFromEnv, OutboundHostValidator } from '@microsoft/agents-hosting';
 import { createSwitchboard } from './app.ts';
+import { createAnthropicClient } from './claude/client.ts';
 import { parseChannelsConfig } from './config/channels.ts';
 import { type Env, loadEnv } from './config/env.ts';
 import { createLogger } from './core/logger.ts';
@@ -34,7 +34,7 @@ const main = async () => {
     const { app, relay, reconciler } = createSwitchboard({
         config,
         store,
-        anthropic: new Anthropic({ apiKey: env.anthropicApiKey, baseURL: env.anthropicBaseUrl ?? null }),
+        anthropic: createAnthropicClient(env),
         webhookSecret: env.webhookSecret,
         mcpTokens: env.mcpTokens,
         authConfig: loadAuthConfigFromEnv(),
@@ -49,6 +49,7 @@ const main = async () => {
             publicUrl: env.publicUrl,
             channels: Object.keys(config.channels),
             store: env.store.kind,
+            anthropicAuth: env.anthropicAuth,
             mcpTokens: env.mcpTokens.map((t) => t.name),
         },
         'switchboard started'

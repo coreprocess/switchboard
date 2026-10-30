@@ -19,7 +19,9 @@ export interface Env {
     publicUrl: string | undefined;
     logLevel: string;
     production: boolean;
-    anthropicApiKey: string;
+    /** Unset with Workload Identity Federation: the SDK then signs in with the `ANTHROPIC_FEDERATION_*` settings. */
+    anthropicApiKey: string | undefined;
+    anthropicAuth: 'api-key' | 'federation';
     anthropicBaseUrl: string | undefined;
     webhookSecret: string;
     mcpTokens: McpToken[];
@@ -61,6 +63,27 @@ const required = (env: NodeJS.ProcessEnv, name: string): string => {
     return value;
 };
 
+const FEDERATION_SETTINGS = [
+    'ANTHROPIC_FEDERATION_RULE_ID',
+    'ANTHROPIC_ORGANIZATION_ID',
+    'ANTHROPIC_SERVICE_ACCOUNT_ID',
+];
+
+/**
+ * How Switchboard signs in to the Claude API: `ANTHROPIC_API_KEY`, or Workload Identity Federation, which the SDK
+ * resolves itself from `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID`,
+ * `ANTHROPIC_WORKSPACE_ID` and the identity token (`ANTHROPIC_IDENTITY_TOKEN_FILE`). A key wins over federation.
+ */
+const anthropicAuthOf = (env: NodeJS.ProcessEnv): Env['anthropicAuth'] => {
+    if (env.ANTHROPIC_API_KEY?.trim()) return 'api-key';
+    const missing = FEDERATION_SETTINGS.filter((name) => !env[name]?.trim());
+    if (!env.ANTHROPIC_IDENTITY_TOKEN_FILE?.trim() && !env.ANTHROPIC_IDENTITY_TOKEN?.trim()) {
+        missing.push('ANTHROPIC_IDENTITY_TOKEN_FILE');
+    }
+    if (missing.length === 0) return 'federation';
+    throw new Error(`ANTHROPIC_API_KEY is required, or Workload Identity Federation: ${missing.join(', ')}`);
+};
+
 /** The bot's app ID from the Agents SDK connection settings (`CONNECTIONS__<name>__SETTINGS__CLIENTID`). */
 const botClientIdOf = (env: NodeJS.ProcessEnv): string | undefined =>
     Object.entries(env).find(([key, value]) => /^connections__[^_].*__settings__clientid$/i.test(key) && value)?.[1];
@@ -92,7 +115,8 @@ export const loadEnv = (env: NodeJS.ProcessEnv): Env => {
         publicUrl: env.SWITCHBOARD_PUBLIC_URL?.trim() || undefined,
         logLevel: env.LOG_LEVEL?.trim() || 'info',
         production,
-        anthropicApiKey: required(env, 'ANTHROPIC_API_KEY'),
+        anthropicApiKey: env.ANTHROPIC_API_KEY?.trim() || undefined,
+        anthropicAuth: anthropicAuthOf(env),
         anthropicBaseUrl: env.ANTHROPIC_BASE_URL?.trim() || undefined,
         webhookSecret: required(env, 'CLAUDE_WEBHOOK_SECRET'),
         mcpTokens: parseMcpTokens(env.SWITCHBOARD_MCP_TOKENS?.trim() || '{}'),

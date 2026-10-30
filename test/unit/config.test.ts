@@ -112,6 +112,28 @@ describe('environment', () => {
         assert.deepEqual(loaded.mcpTokens, []);
     });
 
+    it('signs in with Workload Identity Federation when no API key is set', () => {
+        const federation = {
+            ...env,
+            ANTHROPIC_API_KEY: undefined,
+            ANTHROPIC_FEDERATION_RULE_ID: 'fdrl_test',
+            ANTHROPIC_ORGANIZATION_ID: '00000000-0000-0000-0000-000000000000',
+            ANTHROPIC_SERVICE_ACCOUNT_ID: 'svac_test',
+            ANTHROPIC_IDENTITY_TOKEN_FILE: '/var/run/secrets/anthropic.com/token',
+        };
+        assert.equal(loadEnv(env).anthropicAuth, 'api-key');
+        assert.equal(loadEnv(federation).anthropicAuth, 'federation');
+        assert.equal(loadEnv(federation).anthropicApiKey, undefined);
+        assert.throws(
+            () => loadEnv({ ...federation, ANTHROPIC_IDENTITY_TOKEN_FILE: undefined }),
+            /ANTHROPIC_API_KEY is required, or Workload Identity Federation: ANTHROPIC_IDENTITY_TOKEN_FILE/
+        );
+        assert.throws(
+            () => loadEnv({ ...federation, ANTHROPIC_FEDERATION_RULE_ID: '' }),
+            /ANTHROPIC_FEDERATION_RULE_ID/
+        );
+    });
+
     it('requires secrets, a store and the bot ID in production', () => {
         assert.throws(() => loadEnv({ ...env, ANTHROPIC_API_KEY: '' }), /ANTHROPIC_API_KEY/);
         assert.throws(() => loadEnv({ ...env, STORE_TABLES_ENDPOINT: undefined }), /STORE_TABLES_ENDPOINT/);

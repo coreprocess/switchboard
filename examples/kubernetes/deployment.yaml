@@ -56,12 +56,26 @@ spec:
               value: /var/run/secrets/azure/tokens/azure-identity-token
             - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__SCOPE
               value: https://api.botframework.com
+            # Claude API sign-in through Workload Identity Federation: the projected token below, no API key.
+            - name: ANTHROPIC_IDENTITY_TOKEN_FILE
+              value: /var/run/secrets/anthropic.com/token
+            - name: ANTHROPIC_FEDERATION_RULE_ID
+              value: fdrl_xxx
+            - name: ANTHROPIC_ORGANIZATION_ID
+              value: "00000000-0000-0000-0000-000000000000"
+            - name: ANTHROPIC_SERVICE_ACCOUNT_ID
+              value: svac_xxx
+            - name: ANTHROPIC_WORKSPACE_ID
+              value: wrkspc_xxx
           envFrom:
             - secretRef:
                 name: switchboard
           volumeMounts:
             - name: channels
               mountPath: /etc/switchboard
+              readOnly: true
+            - name: anthropic-token
+              mountPath: /var/run/secrets/anthropic.com
               readOnly: true
           livenessProbe:
             httpGet:
@@ -88,3 +102,13 @@ spec:
         - name: channels
           configMap:
             name: switchboard-channels
+        # Anthropic accepts each token once; the kubelet replaces it at 80% of its lifetime, so the SDK finds a new
+        # one at every refresh (federation rule token lifetime 3600 s). A container restart in the same pod waits
+        # for the next replacement (up to about 8 minutes); a new pod starts with a fresh token.
+        - name: anthropic-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: https://api.anthropic.com
+                  expirationSeconds: 600
+                  path: token

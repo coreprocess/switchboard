@@ -141,7 +141,9 @@ To bind a channel, copy its link (⋯ → Get link to channel): the `19:…@thre
 
 ### 6. Claude workspace
 
-1. **API key**: create a key in the workspace the agents live in; it becomes `ANTHROPIC_API_KEY`.
+1. **Sign-in**, either way in the workspace the agents live in:
+   - **Workload Identity Federation** (recommended on Kubernetes, no static secret): Console → Settings → Workload identity → Connect workload → Kubernetes. Issuer: the cluster's OIDC issuer URL with discovery (or inline JWKS for a private issuer); rule match: subject `system:serviceaccount:<namespace>:switchboard` and audience `https://api.anthropic.com`; scope `workspace:developer`; token lifetime 3600 seconds. Project a service-account token with that audience into the pod and set `ANTHROPIC_IDENTITY_TOKEN_FILE`, `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID` and `ANTHROPIC_WORKSPACE_ID` (see [`examples/kubernetes/deployment.yaml`](examples/kubernetes/deployment.yaml)). The SDK exchanges the token for a short-lived access token and refreshes it before it expires, re-reading the token file each time.
+   - **API key**: a service account key for that workspace becomes `ANTHROPIC_API_KEY`. A key wins over federation, so leave it unset when federating.
 2. **Webhook endpoint**: Console → Manage → Webhooks, URL `https://<host>/webhooks/claude`, event types `session.status_idled`, `session.status_terminated`, `vault_credential.refresh_failed` and `deployment_run.failed`. The signing secret (`whsec_…`, shown once) becomes `CLAUDE_WEBHOOK_SECRET`.
 3. **MCP server on the agent**: add `{"type": "url", "name": "switchboard", "url": "https://<host>/mcp"}` to the agent's `mcp_servers` and `{"type": "mcp_toolset", "mcp_server_name": "switchboard"}` to its tools. The name must match `mcp_server_name` in the channels file (default `switchboard`).
 4. **Vault credential**: generate a random token (`openssl rand -base64 48`), add it to `SWITCHBOARD_MCP_TOKENS` with the channels it may use, and store it in a vault as a `static_bearer` credential with `mcp_server_url` `https://<host>/mcp`. List that vault in the channel's `vault_ids` (and in the deployment of scheduled runs that post).
@@ -152,7 +154,9 @@ To bind a channel, copy its link (⋯ → Get link to channel): the `19:…@thre
 
 | Variable | Required | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | yes, secret | Workspace-scoped Claude API key |
+| `ANTHROPIC_API_KEY` | secret | Claude API key for the agents' workspace; required unless Workload Identity Federation is configured, and wins over it when set |
+| `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID`, `ANTHROPIC_WORKSPACE_ID` | without API key | Workload Identity Federation: the federation rule (`fdrl_…`), the organization ID, the rule's service account (`svac_…`) and the workspace (`wrkspc_…`) |
+| `ANTHROPIC_IDENTITY_TOKEN_FILE` | without API key | Path of the identity token (a projected service-account token with the rule's audience) |
 | `CLAUDE_WEBHOOK_SECRET` | yes, secret | Signing secret of the Claude webhook endpoint (`whsec_…`) |
 | `SWITCHBOARD_MCP_TOKENS` | secret | JSON object: token → channel keys, e.g. `{"<token>": ["ops"]}` or `{"<token>": {"name": "ops-agent", "channels": ["ops"]}}`. Tokens have at least 32 characters; the name appears in logs. Default `{}` (no MCP access) |
 | `SWITCHBOARD_CONFIG` | yes | Path of the channels file |
@@ -208,7 +212,7 @@ Sessions get `title` `<prefix>: <first line of the message>` and `metadata` `swi
 - **Untrusted input on all sides.** Teams activities and agent tool calls are validated before use. Only activities from bound channels in the configured tenant are processed; personal chats, group chats and other teams get a short "not configured" answer when they address the bot, and are ignored otherwise.
 - **Who may act.** Everyone who can post in a bound channel (the team's members) may talk to its agent and decide approvals; `access: allowlist` narrows that per channel. A click counts only from the card's own channel, thread and message, by an allowed person, never from an automatic invoke (card refresh), and only the first decision per card is applied (conditional write in the store).
 - **The approval marker** cannot be produced by people (see Approvals). The `[teams]` header cannot be forged a second time inside a message either.
-- **No secrets for Microsoft sign-in.** The bot and the store authenticate through workload identity; the only secrets are the Claude API key, the webhook signing secret and the MCP tokens. MCP tokens are kept as SHA-256 digests in memory and compared in constant time. Logs never contain tokens or message text at the default level: errors are logged by type, message, status and code only (HTTP client errors otherwise carry the request), and authorization headers are redacted.
+- **No secrets for Microsoft sign-in.** The bot and the store authenticate through workload identity; with Workload Identity Federation the Claude API needs none either, which leaves the webhook signing secret and the MCP tokens (plus the Claude API key without federation). MCP tokens are kept as SHA-256 digests in memory and compared in constant time. Logs never contain tokens or message text at the default level: errors are logged by type, message, status and code only (HTTP client errors otherwise carry the request), and authorization headers are redacted.
 - **Webhooks** are verified with the SDK (`webhooks.unwrap()`: signature and freshness) on the raw body, and always followed by fetching the resource; their order is never trusted.
 - **Outbound hosts.** In production the Agents SDK's outbound allowlist (Microsoft's Bot Framework hosts) is enabled.
 - **Container.** Distroless Node.js image, numeric non-root user, read-only root filesystem in the example Deployment.
