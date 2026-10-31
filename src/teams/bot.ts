@@ -49,16 +49,39 @@ export class TeamsBot {
         const origin = teamsOriginOf(activity);
         if (!origin.tenantId || !sb.settings.tenants.includes(origin.tenantId)) return;
         await this.#rememberTeam(activity, origin);
-        if (activity.type !== 'message' && activity.type !== 'invoke') return;
-        // Teams may deliver an activity twice; every pod handles it at most once
-        if (
-            activity.id &&
-            !(await markSeen(sb.entities, 'activity', `${origin.conversationId}|${activity.type}|${activity.id}`))
-        ) {
+        if (activity.type === 'messageUpdate') return this.#onEdit(context, origin);
+        if (activity.type !== 'message' && activity.type !== 'invoke') {
+            sb.log.debug({ type: activity.type }, 'activity ignored');
             return;
         }
+        if (activity.id && !(await this.#firstTime(origin, activity.type, activity.id))) return;
         if (activity.type === 'message') return this.#onMessage(context, origin);
         return this.#onInvoke(context, origin);
+    }
+
+    /** Whether this is the first time any pod handles the activity: Teams may deliver one twice. */
+    #firstTime(origin: TeamsOrigin, type: string, id: string): Promise<boolean> {
+        return markSeen(this.#sb.entities, 'activity', `${origin.conversationId}|${type}|${id}`);
+    }
+
+    /**
+     * An edited message. If Switchboard received the message before, the edit is ignored: sessions are not told
+     * about edits. If it never did (Teams lost the message, or someone added the @mention afterwards), the edited
+     * message is handled as the message itself, once.
+     */
+    async #onEdit(context: TurnContext, origin: TeamsOrigin) {
+        const sb = this.#sb;
+        const messageId = context.activity.id;
+        if (origin.eventType !== 'editMessage' || !messageId) {
+            sb.log.debug({ eventType: origin.eventType }, 'message update ignored');
+            return;
+        }
+        if (!(await this.#firstTime(origin, 'message', messageId))) {
+            sb.log.info({ messageId }, 'edit ignored: the message was received before');
+            return;
+        }
+        sb.log.info({ messageId }, 'edited message handled: the message was not received before');
+        return this.#onMessage(context, origin);
     }
 
     /** Stores the team's conversation reference, so Switchboard can post into its channels proactively. */

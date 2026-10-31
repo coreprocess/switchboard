@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import { APPENDIX_HEADING } from '../../src/claude/templates.ts';
 import { WORKING_TEXT } from '../../src/sessions/sessions.ts';
-import { CHANNEL, eventually, type Harness, startHarness, USER, WORKSPACE } from '../helpers/harness.ts';
+import { BOT, CHANNEL, eventually, type Harness, startHarness, USER, WORKSPACE } from '../helpers/harness.ts';
 
 const sessionsOf = (h: Harness) => [...h.claude.sessions.keys()];
 
@@ -91,6 +91,42 @@ describe('conversations', () => {
         const first = h.claude.userMessages(sessionId)[0] ?? '';
         assert.ok(first.includes('[user-typed switchboard:card] card=card_x'));
         assert.ok(!/^\[switchboard:card\]/m.test(first));
+    });
+
+    it('handles an edit of a message Teams never delivered as the message itself, once', async () => {
+        const created = h.claude.createRequests.length;
+        const lost = h.message('Is the import broken?');
+        h.connector.human(lost);
+        const edit = {
+            ...lost,
+            type: 'messageUpdate',
+            text: '<at>Switchboard</at> Is the import broken again?',
+            entities: [{ type: 'mention', mentioned: { id: BOT, name: 'Switchboard' }, text: '<at>Switchboard</at>' }],
+            channelData: { ...lost.channelData, eventType: 'editMessage' },
+        };
+        await Promise.all([h.post(edit), h.post(edit)]);
+        await eventually(() => h.thread(lost.id).includes('Echo: Is the import broken again?'), 8000, 'answer');
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        assert.equal(h.claude.createRequests.length, created + 1, 'one session for two deliveries of the edit');
+        assert.match(h.firstText(), /^\[teams\] from="Jane Doe" .*\nIs the import broken again\?$/);
+    });
+
+    it('ignores an edit of a message Switchboard received', async () => {
+        const root = h.message('First wording');
+        await h.post(root);
+        await eventually(() => h.thread(root.id).includes('Echo: First wording'));
+        const sessionId = sessionsOf(h).at(-1) ?? '';
+        const received = h.claude.userMessages(sessionId).length;
+        const created = h.claude.createRequests.length;
+        await h.post({
+            ...root,
+            type: 'messageUpdate',
+            text: 'Second wording',
+            channelData: { ...root.channelData, eventType: 'editMessage' },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.equal(h.claude.userMessages(sessionId).length, received, 'the session is not told about the edit');
+        assert.equal(h.claude.createRequests.length, created);
     });
 
     it('ignores channels that are not bound, except a note for a mention', async () => {

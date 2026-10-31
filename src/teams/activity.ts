@@ -9,6 +9,8 @@ const TeamsChannelData = z.looseObject({
         .looseObject({ id: z.string().optional(), aadGroupId: z.string().optional(), name: z.string().optional() })
         .optional(),
     channel: z.looseObject({ id: z.string().optional(), name: z.string().optional() }).optional(),
+    /** For `messageUpdate` activities: `editMessage`, `undeleteMessage`, … */
+    eventType: z.string().optional(),
 });
 
 /** Where an activity came from, as far as Teams tells us. */
@@ -24,6 +26,8 @@ export interface TeamsOrigin {
     channelId: string | undefined;
     /** Root message of the thread the activity belongs to (channel conversations only). */
     rootId: string | undefined;
+    /** What a `messageUpdate` activity is about (`editMessage` for an edit). */
+    eventType: string | undefined;
 }
 
 /** `19:…@thread.tacv2;messageid=123` → channel conversation and root message ID. */
@@ -49,6 +53,7 @@ export const teamsOriginOf = (activity: Activity): TeamsOrigin => {
         channelId:
             channelData.channel?.id ?? (conversationId.includes('@thread') ? split.channelConversationId : undefined),
         rootId: split.rootId,
+        eventType: channelData.eventType,
     };
 };
 

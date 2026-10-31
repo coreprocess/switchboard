@@ -94,7 +94,8 @@ The two deployments may use different agents. If both should share memory (for e
 - **When the session ends** (terminated, deleted, budget reached, unrecoverable error), its cards close for good and the thread gets a notice: "The next message starts a new session." The next message starts a continuation (below). A thread deleted in Teams gets no notice, so it stays deleted.
 - **Messages deleted in Teams:** if someone deletes the "working…" message, the answer is posted as a new message; `update_card` on a deleted card reports that.
 - **No special threads:** threads from before the binding, very old threads, threads Switchboard posted itself and threads whose entry was deleted after the retention period are all handled the same way; the history always comes from Teams.
-- **Ignored:** messages from Switchboard itself, edits and deletions (later histories show threads as they are).
+- **Edits:** an edit of a message Switchboard never received is handled like the message itself, once. That covers a message Teams did not deliver, and adding the @mention afterwards to get the agent's attention. Edits of messages Switchboard received are not passed on; later histories show the edited text.
+- **Ignored:** messages from Switchboard itself and deletions (later histories show threads as they are).
 - **Unbound channels, personal and group chats:** only commands are handled; an @mention gets a short note that Switchboard is not set up there.
 
 Everyone who can post in a bound channel can talk to the agent, click its cards and run `status`. Teams channel membership is the access control; Switchboard adds no filter of its own, also not for guests. Restrict access by choosing the channel.
