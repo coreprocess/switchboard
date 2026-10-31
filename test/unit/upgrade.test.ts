@@ -61,7 +61,10 @@ describe('upgrade', () => {
 
         const answer = await upgrade();
         assert.match(answer, /Conversation deployment ops-conversation: Ops Agent v1 → v2/);
-        assert.match(answer, /Job deployment ops-hourly-check: Ops Agent v1 → v2/);
+        assert.match(
+            answer,
+            /Job deployment ops-hourly-check: Ops Agent v1 → v2\n\nRunning sessions keep their version/
+        );
         assert.equal(pinned(h, 'depl_conversation'), 2);
         assert.equal(pinned(h, 'depl_job'), 2);
         assert.equal(pinned(h, 'depl_other'), 1, 'another channel’s deployment is unchanged');

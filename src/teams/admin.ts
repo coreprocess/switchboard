@@ -317,6 +317,8 @@ export const upgradeAnswer = (result: UpgradeResult): string => {
             (d) => `- ${ROLES[d.kind]} ${d.deploymentName}: ${d.agentName} v${d.from} → v${d.to}`
         ),
         ...saved,
+        // a blank line ends the list; otherwise Markdown joins the sentence to the last item
+        '',
         'Running sessions keep their version; new sessions use the new one.',
     ].join('\n');
 };
