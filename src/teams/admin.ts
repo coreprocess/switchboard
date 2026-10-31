@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import type { DeploymentInfo } from '../claude/templates.ts';
+import { Upgrade, type UpgradeResult } from '../claude/upgrade.ts';
 import { isTimeZone } from '../config/env.ts';
 import { channelOf } from '../conversations/conversations.ts';
 import type { CardJson, ChannelRef } from '../core/platform.ts';
@@ -93,6 +94,8 @@ export class ChannelAdmin {
                     return { text: `The run could not start: ${run.reason ?? 'unknown error'}` };
                 return { text: `▶️ Job run started (session \`${run.sessionId ?? 'pending'}\`).` };
             }
+            case 'upgrade':
+                return { text: await this.upgrade(binding, job) };
             case 'disconnect':
                 await this.disconnect(binding, actor);
                 return { text: '🔌 Switchboard is disconnected from this channel.' };
@@ -228,14 +231,27 @@ export class ChannelAdmin {
             .catch(() => undefined);
     }
 
-    async #describe(workspaceId: string, deploymentId: string): Promise<string> {
+    /** `upgrade`: moves the channel's deployments to the newest agent versions (concept: "Upgrading"). */
+    async upgrade(binding: Binding, job: Job | undefined): Promise<string> {
+        const sb = this.#sb;
+        const targets = [
+            { deploymentId: binding.conversationDeploymentId, kind: 'conversation' as const },
+            ...(job ? [{ deploymentId: job.deploymentId, kind: 'job' as const }] : []),
+        ];
+        const result = await new Upgrade(sb.workspaces.get(binding.workspaceId), sb.templates).run(targets);
+        sb.log.info({ channelId: binding.channelId, outcome: result.outcome }, 'upgrade');
+        return upgradeAnswer(result);
+    }
+
+    /** A deployment as `status` shows it, and whether its agent has a newer version. */
+    async #describe(workspaceId: string, deploymentId: string): Promise<{ text: string; outdated: boolean }> {
         const sb = this.#sb;
         try {
-            const deployment = await sb.templates.deployment(workspaceId, deploymentId);
-            const info: DeploymentInfo = await sb.templates.describe(workspaceId, deployment);
-            return describeDeployment(info);
+            const deployment = await sb.templates.deployment(workspaceId, deploymentId, true);
+            const info: DeploymentInfo = await sb.templates.describe(workspaceId, deployment, true);
+            return { text: describeDeployment(info), outdated: info.latestAgentVersion > info.agentVersion };
         } catch {
-            return `${deploymentId} (could not be read)`;
+            return { text: `${deploymentId} (could not be read)`, outdated: false };
         }
     }
 
@@ -246,14 +262,14 @@ export class ChannelAdmin {
         if (!binding) return NOT_SET_UP;
         const zone = sb.settings.defaultTimezone;
         const lines = [`**Switchboard in ${binding.channelName}**`];
-        lines.push(
-            `- Conversation deployment: ${await this.#describe(binding.workspaceId, binding.conversationDeploymentId)}`
-        );
+        const conversationDeployment = await this.#describe(binding.workspaceId, binding.conversationDeploymentId);
+        lines.push(`- Conversation deployment: ${conversationDeployment.text}`);
         const job = await this.job(binding.channelId);
-        if (job) {
+        const jobDeployment = job ? await this.#describe(binding.workspaceId, job.deploymentId) : undefined;
+        if (job && jobDeployment) {
             const last = await sb.jobs.latestRun(job.jobId);
             const next = job.enabled ? nextRun(job, sb.now()) : undefined;
-            lines.push(`- Job deployment: ${await this.#describe(binding.workspaceId, job.deploymentId)}`);
+            lines.push(`- Job deployment: ${jobDeployment.text}`);
             const lastRun = last
                 ? `${last.status === 'running' ? 'running since' : `${last.status}${last.reason ? ` (${clip(last.reason, 120)})` : ''}, started`} ` +
                   formatLocal(new Date(last.startedAt), zone)
@@ -270,7 +286,37 @@ export class ChannelAdmin {
             where: [{ field: 'owningSession', op: 'gt', value: '' }],
         });
         lines.push(`- Conversations with an active session: ${owned.length}`);
+        if (conversationDeployment.outdated || jobDeployment?.outdated) {
+            lines.push(
+                '- Newer agent versions exist: an admin moves the deployments to them with `@Switchboard upgrade`.'
+            );
+        }
         if (binding.channelNote) lines.push(`- Limitation: ${binding.channelNote}`);
         return lines.join('\n');
     }
 }
+
+const ROLES = { conversation: 'Conversation deployment', job: 'Job deployment' } as const;
+
+/** What `upgrade` did, as the admin reads it. */
+export const upgradeAnswer = (result: UpgradeResult): string => {
+    if (result.outcome === 'up_to_date') return '✅ Everything is up to date.';
+    const saved = result.agents.map(
+        (agent) => `- New version of agent ${agent.agentName}: v${agent.from} → v${agent.to} (references raised)`
+    );
+    if (result.outcome === 'refused') {
+        return [
+            '⚠️ No deployment was changed:',
+            ...result.problems.map((problem) => `- ${problem}`),
+            ...(saved.length > 0 ? ['', 'Agent versions saved before the check:', ...saved] : []),
+        ].join('\n');
+    }
+    return [
+        '⬆️ Upgraded:',
+        ...result.deployments.map(
+            (d) => `- ${ROLES[d.kind]} ${d.deploymentName}: ${d.agentName} v${d.from} → v${d.to}`
+        ),
+        ...saved,
+        'Running sessions keep their version; new sessions use the new one.',
+    ].join('\n');
+};

@@ -38,6 +38,14 @@ const error = (res: Response, status: number, message: string) =>
         error: { type: status === 404 ? 'not_found_error' : 'invalid_request_error', message },
     });
 
+/** The platform's merge of a `multiagent_20261001` update into the stored configuration, member by member. */
+const mergeMultiagent = (stored: Json | null, update: Json | null): Json | null => {
+    if (!update || !stored || stored.type !== update.type || update.type !== 'multiagent_20261001') return update;
+    const member = (key: string) =>
+        update[key] === undefined ? stored[key] : { ...(stored[key] as Json), ...(update[key] as Json) };
+    return { ...stored, advisor: member('advisor'), subagents: member('subagents'), workflows: member('workflows') };
+};
+
 const textOf = (content: Json[]) =>
     content
         .filter((block) => block.type === 'text')
@@ -56,6 +64,9 @@ export class MockClaude {
     readonly files = new Map<string, { name: string; size: number }>();
     readonly deletedFiles: string[] = [];
     readonly deletedSessions: string[] = [];
+    /** Agent versions saved and deployments changed through the API (`POST /v1/agents/:id`, `/v1/deployments/:id`). */
+    readonly agentUpdates: Json[] = [];
+    readonly deploymentUpdates: Json[] = [];
     /** The agent: runs once per turn. The default answers "Echo: <last line>". */
     agent: (turn: Turn) => Promise<void> = async (turn) => {
         turn.say(`Echo: ${turn.text.split('\n').at(-1)}`);
@@ -64,7 +75,7 @@ export class MockClaude {
     #server: Server | undefined;
     #next = 1;
 
-    addAgent(id: string, fields: { name?: string; system?: string; tools?: Json[] } = {}) {
+    addAgent(id: string, fields: { name?: string; system?: string; tools?: Json[]; multiagent?: Json | null } = {}) {
         const versions = this.agents.get(id) ?? [];
         const previous = versions.at(-1);
         versions.push({
@@ -77,6 +88,7 @@ export class MockClaude {
                 previous?.tools ?? [{ type: 'agent_toolset_20260401', configs: [], default_config: {} }],
             mcp_servers: [],
             skills: [],
+            multiagent: fields.multiagent !== undefined ? fields.multiagent : (previous?.multiagent ?? null),
             model: { id: 'claude-opus-5-5' },
             archived_at: null,
             created_at: '2026-10-31T00:00:00Z',
@@ -226,6 +238,35 @@ export class MockClaude {
             const agent = versions[version - 1];
             if (!agent) return void error(res, 404, 'version not found');
             res.json(agent);
+        });
+
+        app.post('/v1/agents/:id', (req, res) => {
+            const versions = this.agents.get(req.params.id);
+            const latest = versions?.at(-1);
+            if (!versions || !latest) return void error(res, 404, 'agent not found');
+            const body = req.body as Json;
+            if (body.version !== undefined && body.version !== latest.version) {
+                return void error(res, 409, 'version is not the current version');
+            }
+            const { version: _version, multiagent, ...fields } = body;
+            const next: Json = { ...latest, ...fields, version: versions.length + 1 };
+            if (multiagent !== undefined)
+                next.multiagent = mergeMultiagent(latest.multiagent as Json | null, multiagent as Json | null);
+            versions.push(next);
+            this.agentUpdates.push({ id: req.params.id, ...body });
+            res.json(next);
+        });
+        app.post('/v1/deployments/:id', (req, res) => {
+            const deployment = this.deployments.get(req.params.id);
+            if (!deployment) return void error(res, 404, 'deployment not found');
+            const { agent, ...fields } = req.body as Json;
+            Object.assign(deployment, fields);
+            if (agent && typeof agent === 'object') {
+                const { id, version } = agent as Json;
+                deployment.agent = { type: 'agent', id, version };
+            }
+            this.deploymentUpdates.push({ id: req.params.id, ...(req.body as Json) });
+            res.json(deployment);
         });
 
         app.post('/v1/sessions', (req, res) => {

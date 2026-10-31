@@ -64,9 +64,10 @@ Commands are messages that @mention Switchboard and consist only of the command 
 | Command | Who | Effect |
 |---|---|---|
 | `settings` | admin | Posts the settings card |
-| `status` | everyone | Binding, conversation and job deployment (name, ID, agent version used, hint when the agent has a newer version), the job (schedule, on/off, last run with its result or the start of a running one, next run), the number of conversations with an owning session, known channel limitations |
+| `status` | everyone | Binding, conversation and job deployment (name, ID, agent version used, hint when the agent has a newer version), the job (schedule, on/off, last run with its result or the start of a running one, next run), the number of conversations with an owning session, known channel limitations, and a hint to `upgrade` when an agent has a newer version |
 | `pause` / `resume` | admin | Turns the job off or on |
 | `run` | admin | Starts a job run now (under the one-at-a-time rule) |
+| `upgrade` | admin | Moves the channel's deployments to the newest agent versions (below) |
 | `disconnect` | admin | Removes the binding |
 
 When someone who is not an admin tries an admin action, Switchboard answers "Only Switchboard admins can change this." and changes nothing.
@@ -99,6 +100,17 @@ The two deployments may use different agents. If both should share memory (for e
 Everyone who can post in a bound channel can talk to the agent, click its cards and run `status`. Teams channel membership is the access control; Switchboard adds no filter of its own, also not for guests. Restrict access by choosing the channel.
 
 **Private and shared channels:** Switchboard does not restrict channel types, but Microsoft's delivery of all channel messages to apps (without @mention) is not reliably available for private and shared channels yet (see Microsoft message center item MC1197145). A channel that is not in the team's list of standard channels gets a warning on the settings card and in `status`; mention Switchboard there to be sure messages arrive.
+
+### Upgrading a channel's agents
+
+Deployments pin a fixed agent version, and agents pin fixed versions of the agents they use as subagents, in workflows or in a coordinator's roster; only skills follow "latest". `@Switchboard upgrade` (admins) does the manual steps for one channel, at once and without a preview:
+
+1. For the conversation deployment and the job deployment, it follows the pinned versions: deployment → agent → the agents it references, recursively, each agent once.
+2. Inside out, an agent that references an outdated version of another agent gets a new version: its newest version with only those references raised. The platform merges the change into the stored configuration; everything else stays as it is.
+3. It checks what the deployments will run, as Save on the settings card does (not archived, no schedule, first events, no clashing tool names). If a check fails, no deployment is changed and the answer names the problem.
+4. It moves the deployments to their agents' newest versions and answers with old → new versions per deployment and the agent versions it saved, or "Everything is up to date".
+
+Running sessions keep their version; new sessions use the new one. An agent version saved in step 2 becomes the agent's newest version for every channel; other channels' deployments keep their versions until someone runs `upgrade` there. Switchboard's Claude service account needs permission to update agents and deployments.
 
 ### Sessions from deployment templates
 
@@ -331,7 +343,7 @@ Build the app package with the bot's app ID and upload it (Teams → Apps → Ma
 pnpm teams-app --bot-id <app id>          # writes teams-app/build/switchboard.zip
 ```
 
-The manifest ([`teams-app/manifest.template.json`](teams-app/manifest.template.json)) installs the bot in team scope with the resource-specific permission `ChannelMessage.Read.Group`: the bot receives every channel message without a mention and can read threads through Graph. A team owner grants it at install. The command list (`settings`, `status`, `pause`, `resume`, `run`, `disconnect`) appears in the compose box.
+The manifest ([`teams-app/manifest.template.json`](teams-app/manifest.template.json)) installs the bot in team scope with the resource-specific permission `ChannelMessage.Read.Group`: the bot receives every channel message without a mention and can read threads through Graph. A team owner grants it at install. The command list (`settings`, `status`, `pause`, `resume`, `run`, `upgrade`, `disconnect`) appears in the compose box.
 
 ### 7. Bind a channel
 

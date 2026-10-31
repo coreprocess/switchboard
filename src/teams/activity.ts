@@ -77,7 +77,7 @@ export const messageText = (activity: Activity): string => {
     return htmlToMarkdown(text.replace(/<at>([^<]*)<\/at>/g, '@$1'));
 };
 
-export const COMMANDS = ['settings', 'status', 'pause', 'resume', 'run', 'disconnect'] as const;
+export const COMMANDS = ['settings', 'status', 'pause', 'resume', 'run', 'upgrade', 'disconnect'] as const;
 export type Command = (typeof COMMANDS)[number];
 
 /** A command: a message that mentions the bot and consists only of the command word. */

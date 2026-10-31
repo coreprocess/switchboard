@@ -43,6 +43,10 @@
                         { "title": "pause", "description": "Admins: turn the channel's job off" },
                         { "title": "resume", "description": "Admins: turn the channel's job on" },
                         { "title": "run", "description": "Admins: start a job run now" },
+                        {
+                            "title": "upgrade",
+                            "description": "Admins: move this channel's deployments to the newest agent versions"
+                        },
                         { "title": "disconnect", "description": "Admins: disconnect Switchboard from this channel" }
                     ]
                 }

@@ -104,17 +104,19 @@ export class Templates {
         );
     }
 
-    /** An agent version never changes, so pinned versions are cached longer than "latest". */
-    agent(workspaceId: string, agentId: string, version?: number): Promise<Agent> {
+    /** An agent version never changes, so pinned versions are cached longer than "latest" (`fresh` skips it). */
+    agent(workspaceId: string, agentId: string, version?: number, fresh = false): Promise<Agent> {
         const key = `${workspaceId}/${agentId}/${version ?? 'latest'}`;
+        if (fresh) this.#agents.delete(key);
         const ttl = version === undefined ? this.#cacheMs : 60 * this.#cacheMs;
         return this.#cached(this.#agents, key, ttl, () =>
             this.#workspaces.get(workspaceId).retrieveAgent(agentId, version)
         );
     }
 
-    async describe(workspaceId: string, deployment: Deployment): Promise<DeploymentInfo> {
-        const latest = await this.agent(workspaceId, deployment.agent.id);
+    /** The deployment as people choose it; `fresh` reads the agent's newest version instead of the cached one. */
+    async describe(workspaceId: string, deployment: Deployment, fresh = false): Promise<DeploymentInfo> {
+        const latest = await this.agent(workspaceId, deployment.agent.id, undefined, fresh);
         return {
             workspaceId,
             workspaceName: this.#workspaces.get(workspaceId).workspaceName,
@@ -142,8 +144,16 @@ export class Templates {
         return options.sort((a, b) => a.name.localeCompare(b.name));
     }
 
-    /** Problems that stop a deployment from serving in this role; empty when it can. */
-    async check(workspaceId: string, deploymentId: string, kind: SessionKind): Promise<string[]> {
+    /**
+     * Problems that stop a deployment from serving in this role, with the agent version it pins or the one given
+     * (`upgrade` checks the version it is about to pin); empty when it can serve.
+     */
+    async check(
+        workspaceId: string,
+        deploymentId: string,
+        kind: SessionKind,
+        agentVersion?: number
+    ): Promise<string[]> {
         let deployment: Deployment;
         try {
             deployment = await this.deployment(workspaceId, deploymentId, true);
@@ -165,7 +175,7 @@ export class Templates {
             );
         }
         try {
-            const agent = await this.agent(workspaceId, deployment.agent.id, deployment.agent.version);
+            const agent = await this.agent(workspaceId, deployment.agent.id, agentVersion ?? deployment.agent.version);
             if (agent.archived_at !== null) problems.push(`the agent of ${name} is archived`);
             const clashes = clashingTools(agent);
             if (clashes.length > 0) {

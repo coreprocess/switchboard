@@ -1,8 +1,8 @@
 import Anthropic, { APIError } from '@anthropic-ai/sdk';
 import { identityTokenFromFile } from '@anthropic-ai/sdk/lib/credentials/identity-token';
 import { oidcFederationProvider } from '@anthropic-ai/sdk/lib/credentials/oidc-federation';
-import type { BetaManagedAgentsAgent } from '@anthropic-ai/sdk/resources/beta/agents/agents';
-import type { BetaManagedAgentsDeployment } from '@anthropic-ai/sdk/resources/beta/deployments';
+import type { AgentUpdateParams, BetaManagedAgentsAgent } from '@anthropic-ai/sdk/resources/beta/agents/agents';
+import type { BetaManagedAgentsDeployment, DeploymentUpdateParams } from '@anthropic-ai/sdk/resources/beta/deployments';
 import type {
     BetaManagedAgentsSessionEvent,
     BetaManagedAgentsSessionEventType,
@@ -18,6 +18,8 @@ import type { Settings, WorkspaceConfig } from '../config/env.ts';
 
 export type Agent = BetaManagedAgentsAgent;
 export type Deployment = BetaManagedAgentsDeployment;
+export type AgentUpdate = AgentUpdateParams;
+export type DeploymentUpdate = DeploymentUpdateParams;
 export type Session = BetaManagedAgentsSession;
 export type SessionEvent = BetaManagedAgentsSessionEvent;
 export type StreamEvent = BetaManagedAgentsStreamSessionEvents;
@@ -51,6 +53,10 @@ export interface ClaudeApi {
     listDeployments(): Promise<Deployment[]>;
     /** The agent in the given version, or its latest version. */
     retrieveAgent(agentId: string, version?: number): Promise<Agent>;
+    /** Saves a new version of the agent; with `version`, only if that is still its newest version. */
+    updateAgent(agentId: string, update: AgentUpdate): Promise<Agent>;
+    /** Changes the given fields of the deployment. */
+    updateDeployment(deploymentId: string, update: DeploymentUpdate): Promise<Deployment>;
     createSession(params: CreateSessionParams): Promise<Session>;
     retrieveSession(sessionId: string): Promise<Session>;
     archiveSession(sessionId: string): Promise<void>;
@@ -93,6 +99,8 @@ export const createClaudeApi = (
         return deployments;
     },
     retrieveAgent: (agentId, version) => client.beta.agents.retrieve(agentId, version === undefined ? {} : { version }),
+    updateAgent: (agentId, update) => client.beta.agents.update(agentId, update),
+    updateDeployment: (deploymentId, update) => client.beta.deployments.update(deploymentId, update),
     createSession: (params) => client.beta.sessions.create(params),
     retrieveSession: (sessionId) => client.beta.sessions.retrieve(sessionId),
     archiveSession: async (sessionId) => {
