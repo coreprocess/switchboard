@@ -49,6 +49,22 @@ export const teamsOriginOf = (activity: Activity): TeamsOrigin => {
     };
 };
 
+/**
+ * Whether the activity's team does not contradict the channel's configured team. Teams sends the team's group ID
+ * with messages but not with card clicks, so only the IDs present on both sides are compared; the channel ID, which
+ * Teams assigns uniquely, has matched already.
+ */
+const teamConsistent = (channel: ChannelBinding, origin: TeamsOrigin): boolean => {
+    if (channel.team_id !== undefined && origin.teamId !== undefined && channel.team_id !== origin.teamId) {
+        return false;
+    }
+    return !(
+        channel.team_aad_group_id !== undefined &&
+        origin.aadGroupId !== undefined &&
+        channel.team_aad_group_id.toLowerCase() !== origin.aadGroupId.toLowerCase()
+    );
+};
+
 /** Whether the activity comes from a channel bound in the configured tenant, and which. */
 export const bindingOf = (config: ChannelsConfig, activity: Activity): Binding => {
     const origin = teamsOriginOf(activity);
@@ -59,12 +75,9 @@ export const bindingOf = (config: ChannelsConfig, activity: Activity): Binding =
         return { bound: false, reason: 'not_a_channel', origin };
     }
     for (const [channelKey, channel] of Object.entries(config.channels)) {
-        if (channel.channel_id !== origin.channelId) continue;
-        const teamMatches =
-            (channel.team_id !== undefined && channel.team_id === origin.teamId) ||
-            (channel.team_aad_group_id !== undefined &&
-                channel.team_aad_group_id.toLowerCase() === origin.aadGroupId?.toLowerCase());
-        if (teamMatches) return { bound: true, channelKey, channel, origin };
+        if (channel.channel_id === origin.channelId && teamConsistent(channel, origin)) {
+            return { bound: true, channelKey, channel, origin };
+        }
     }
     return { bound: false, reason: 'not_bound', origin };
 };

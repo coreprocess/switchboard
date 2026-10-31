@@ -137,7 +137,7 @@ pnpm teams-app --bot-id <app id>          # writes teams-app/build/switchboard.z
 
 The manifest ([`teams-app/manifest.template.json`](teams-app/manifest.template.json)) installs the bot in team scope with the resource-specific consent permission `ChannelMessage.Read.Group`, so it receives replies in linked threads without a mention. A team owner grants it at install; no tenant admin is needed. Installing the app stores the conversation reference Switchboard needs to post into the team's channels proactively.
 
-To bind a channel, copy its link (⋯ → Get link to channel): the `19:…@thread.tacv2` part is `channel_id`, `groupId` is `team_aad_group_id`. Alternatively mention the bot in the channel before it is bound; Switchboard logs the team and channel IDs.
+To bind a channel, copy its link (⋯ → Get link to channel): the `19:…@thread.tacv2` part is `channel_id`, `groupId` is `team_aad_group_id`. Alternatively mention the bot in the channel before it is bound; Switchboard logs the team and channel IDs. An activity is bound by its channel ID; the team IDs it carries must not contradict the configured ones. Teams sends the group ID with messages but not with card clicks, so a click is checked against `team_id` only, if set. Card clicks Switchboard cannot bind are logged with the reason and the IDs Teams sent.
 
 ### 6. Claude workspace
 

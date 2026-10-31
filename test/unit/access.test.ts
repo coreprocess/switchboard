@@ -9,7 +9,7 @@ import {
     textWithoutBotMention,
     userAllowed,
 } from '../../src/teams/access.ts';
-import { CHANNEL, OTHER_CHANNEL, TEAM, TENANT, testConfig } from '../helpers/config.ts';
+import { CHANNEL, groupBoundConfig, OTHER_CHANNEL, TEAM, TEAM_GROUP, TENANT, testConfig } from '../helpers/config.ts';
 
 const BOT = '28:bot-app-id';
 const ALLOWED = 'aaaaaaaa-0000-0000-0000-000000000001';
@@ -68,6 +68,33 @@ describe('channel binding', () => {
             },
         });
         assert.deepEqual(reason(bindingOf(config, otherTeam)), 'not_bound');
+    });
+
+    it('binds card clicks without the group ID to a channel bound by group ID', () => {
+        const groupBound = groupBoundConfig();
+        const message = channelMessage({
+            channelData: {
+                tenant: { id: TENANT },
+                team: { id: TEAM, aadGroupId: TEAM_GROUP },
+                channel: { id: CHANNEL },
+            },
+        });
+        assert.equal(bindingOf(groupBound, message).bound, true);
+        // Teams sends card clicks with the team's thread ID only
+        const click = channelMessage({
+            type: 'invoke',
+            name: 'adaptiveCard/action',
+            channelData: { tenant: { id: TENANT }, team: { id: TEAM }, channel: { id: CHANNEL } },
+        });
+        assert.equal(bindingOf(groupBound, click).bound, true);
+        const otherGroup = channelMessage({
+            channelData: {
+                tenant: { id: TENANT },
+                team: { id: TEAM, aadGroupId: '00000000-0000-0000-0000-00000000000b' },
+                channel: { id: CHANNEL },
+            },
+        });
+        assert.deepEqual(reason(bindingOf(groupBound, otherGroup)), 'not_bound');
     });
 
     it('ignores channelData it cannot parse', () => {

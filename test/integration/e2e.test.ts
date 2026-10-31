@@ -11,7 +11,7 @@ import { createLogger, nullLogger } from '../../src/core/logger.ts';
 import { listen } from '../../src/server/http.ts';
 import { MemoryStore } from '../../src/store/memory.ts';
 import { NOT_CONFIGURED } from '../../src/teams/bot.ts';
-import { CHANNEL, TEAM, TENANT, testConfig } from '../helpers/config.ts';
+import { CHANNEL, groupBoundConfig, TEAM, TEAM_GROUP, TENANT } from '../helpers/config.ts';
 import { eventually } from '../helpers/fakes.ts';
 import { MockClaude } from '../helpers/mock-claude.ts';
 import { MockConnector } from '../helpers/mock-connector.ts';
@@ -41,7 +41,8 @@ describe('switchboard end to end (mock Claude API and Bot Framework connector)',
         serviceUrl: connector.url,
         from: { id: '29:jane', name: 'Jane Doe', aadObjectId: JANE },
         recipient: { id: BOT, name: 'Switchboard' },
-        channelData: { tenant: { id: TENANT }, team: { id: TEAM }, channel: { id: CHANNEL } },
+        // as Teams sends messages: the team's thread ID and its group ID
+        channelData: { tenant: { id: TENANT }, team: { id: TEAM, aadGroupId: TEAM_GROUP }, channel: { id: CHANNEL } },
         ...overrides,
     });
 
@@ -87,7 +88,8 @@ describe('switchboard end to end (mock Claude API and Bot Framework connector)',
         await claude.start();
         await connector.start();
         const { app, relay, reconciler } = createSwitchboard({
-            config: testConfig(),
+            // `ops` is bound by the group ID only, which card clicks do not carry
+            config: groupBoundConfig(),
             store: new MemoryStore(),
             anthropic: new Anthropic({ apiKey: 'test', baseURL: claude.url, maxRetries: 0 }),
             webhookSecret: secret,
@@ -263,6 +265,8 @@ describe('switchboard end to end (mock Claude API and Bot Framework connector)',
                     name: 'adaptiveCard/action',
                     replyToId: card.id,
                     from,
+                    // as Teams sends card clicks: the team's thread ID, no group ID
+                    channelData: { tenant: { id: TENANT }, team: { id: TEAM }, channel: { id: CHANNEL } },
                     conversation: {
                         id: thread(agentRoot),
                         conversationType: 'channel',

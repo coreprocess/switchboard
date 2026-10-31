@@ -223,7 +223,14 @@ export class TeamsBot {
 
         const parsed = CardAction.safeParse(activity.value);
         if (!parsed.success) return void (await message('Unknown action.'));
-        if (!binding.bound) return void (await message(NOT_CONFIGURED));
+        if (!binding.bound) {
+            const { teamId, aadGroupId, channelId, conversationType } = binding.origin;
+            this.#log.info(
+                { reason: binding.reason, conversationType, teamId, aadGroupId, channelId },
+                'card click from an unbound conversation'
+            );
+            return void (await message(NOT_CONFIGURED));
+        }
         if (parsed.data.trigger === 'automatic') return void (await message('Only a click decides.'));
         const result = await this.#approvals.click({
             cardId: parsed.data.action.data.card_id,
