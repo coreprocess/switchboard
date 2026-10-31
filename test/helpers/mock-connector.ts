@@ -104,6 +104,11 @@ export class MockConnector {
         app.put('/v3/conversations/:conversationId/activities/:id', (req, res) => {
             const message = this.messages.find((m) => m.id === req.params.id);
             if (!message) return void res.status(404).end();
+            if (message.deleted) {
+                return void res.status(403).json({
+                    error: { code: 'ActivityDeletedInConversation', message: 'Message has been deleted.' },
+                });
+            }
             message.activity = req.body as Json;
             res.json({ id: message.id });
         });
@@ -142,6 +147,14 @@ export class MockConnector {
             from: { name: from?.name ?? 'unknown', aadObjectId: from?.aadObjectId ?? '' },
             ...options,
         });
+    }
+
+    /** Deletes a thread as a person would in Teams: its root post and every reply. */
+    deleteThread(channelId: string, rootId: string) {
+        const conversationId = `${channelId};messageid=${rootId}`;
+        for (const message of [...this.posts, ...this.messages]) {
+            if (message.conversationId === conversationId) message.deleted = true;
+        }
     }
 
     #at() {

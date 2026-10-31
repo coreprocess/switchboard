@@ -53,6 +53,9 @@ export interface ThreadSummary {
     lastActivity: string;
 }
 
+/** The message Switchboard wanted to change no longer exists in the platform: someone deleted it (or its thread). */
+export class MessageGoneError extends Error {}
+
 /** A cursor the platform did not hand out (agents pass cursors back). */
 export class CursorError extends Error {}
 
@@ -67,7 +70,9 @@ export interface ChannelPlatform {
     postThread(channel: ChannelRef, content: OutboundContent): Promise<{ rootId: string; url: string }>;
     /** Replies in a thread; returns the new message's ID. */
     reply(channel: ChannelRef, rootId: string, content: OutboundContent): Promise<{ messageId: string }>;
+    /** Changes one of Switchboard's messages; `MessageGoneError` when it was deleted. */
     update(channel: ChannelRef, rootId: string, messageId: string, content: OutboundContent): Promise<void>;
+    /** Deletes one of Switchboard's messages; `MessageGoneError` when it was deleted already. */
     delete(channel: ChannelRef, rootId: string, messageId: string): Promise<void>;
     /** Link to a message in the platform's client. */
     messageUrl(channel: ChannelRef, rootId: string, messageId: string): Promise<string>;

@@ -1,6 +1,7 @@
 import type { OutgoingEvent } from '../claude/api.ts';
 import type { ContentBlock, FileResource, SessionKind } from '../claude/templates.ts';
 import { channelOf } from '../conversations/conversations.ts';
+import { MessageGoneError } from '../core/platform.ts';
 import { clip, splitMessage } from '../core/text.ts';
 import { formatLocal } from '../core/time.ts';
 import type { Binding, SessionEntry } from '../store/entities.ts';
@@ -191,8 +192,7 @@ export class Sessions {
         }
         let first: string | undefined;
         for (const [index, chunk] of chunks.entries()) {
-            if (index === 0 && working && !update) {
-                await sb.conversations.publish(channel, entry.rootId, working, { text: chunk }, options);
+            if (index === 0 && working && !update && (await this.#publish(entry, working, chunk))) {
                 first = working;
                 continue;
             }
@@ -201,6 +201,19 @@ export class Sessions {
         }
         if (update && working) await this.ensureWorking({ ...entry, workingMessageId: undefined });
         return first;
+    }
+
+    /** The answer replaces the "working…" message; `false` when someone deleted that message (then it is posted). */
+    async #publish(entry: SessionEntry, working: string, text: string): Promise<boolean> {
+        if (!entry.rootId) return false;
+        const options = { kind: 'answer', sessionId: entry.sessionId } as const;
+        return this.#sb.conversations.publish(channelOf(entry), entry.rootId, working, { text }, options).then(
+            () => true,
+            (error: unknown) => {
+                if (error instanceof MessageGoneError) return false;
+                throw error;
+            }
+        );
     }
 
     /** A notice from Switchboard in the session's thread. */
@@ -246,7 +259,17 @@ export class Sessions {
         if (working) await sb.platform.delete(channelOf(entry), entry.rootId, working).catch(() => undefined);
         await sb.conversations.detach(entry.channelId, entry.rootId, entry.sessionId, reason);
         await sb.cards.closeAll(entry.sessionId);
-        if (notify) await this.notice(entry, endNotice(reason));
+        // a thread deleted in Teams stays deleted: a notice would show it again
+        if (notify && !(await this.#threadDeleted(entry))) await this.notice(entry, endNotice(reason));
+    }
+
+    /** Whether the session's thread was deleted; when that cannot be told, it was not. */
+    async #threadDeleted(entry: SessionEntry): Promise<boolean> {
+        if (!entry.rootId) return false;
+        return this.#sb.platform.thread(channelOf(entry), entry.rootId).then(
+            (thread) => thread === undefined,
+            () => false
+        );
     }
 
     /** Interrupts the session's current turn (timeout, disconnect); `stopping` records why. */

@@ -1,11 +1,12 @@
 import { Activity, type ConversationReference } from '@microsoft/agents-activity';
-import { CloudAdapter } from '@microsoft/agents-hosting';
+import { CloudAdapter, type TurnContext } from '@microsoft/agents-hosting';
 import { z } from 'zod';
 import {
     type ChannelPlatform,
     type ChannelRef,
     CursorError,
     type ImageRef,
+    MessageGoneError,
     type OutboundContent,
     type Page,
     type ThreadMessage,
@@ -50,6 +51,17 @@ const TeamChannels = z.looseObject({
 const latest = (root: GraphMessage) =>
     [root.createdDateTime, ...(root.replies ?? []).map((reply) => reply.createdDateTime)].sort().at(-1) ??
     root.createdDateTime;
+
+/** A Bot Framework error that says the message (or its thread) is gone. */
+const BotFrameworkError = z.object({
+    status: z.number(),
+    response: z.object({ data: z.object({ error: z.object({ code: z.string() }).optional() }).optional() }).optional(),
+});
+const isGone = (error: unknown) => {
+    const parsed = BotFrameworkError.safeParse(error);
+    if (!parsed.success) return false;
+    return parsed.data.status === 404 || parsed.data.response?.data?.error?.code === 'ActivityDeletedInConversation';
+};
 
 /** Opaque cursors for agents; they carry a Graph link that is checked against the channel before use. */
 const encodeCursor = (link: string) => Buffer.from(link).toString('base64url');
@@ -127,23 +139,16 @@ export class TeamsPlatform implements ChannelPlatform {
     }
 
     async reply(channel: ChannelRef, rootId: string, content: OutboundContent) {
-        const ref = await this.#reference(channel.teamId);
         let messageId: string | undefined;
-        await this.#adapter.continueConversation(
-            this.#identity,
-            this.#threadReference(ref, channel, rootId),
-            async (context) => {
-                messageId = (await context.sendActivity(toActivity(content)))?.id;
-            }
-        );
+        await this.#inThread(channel, rootId, async (context) => {
+            messageId = (await context.sendActivity(toActivity(content)))?.id;
+        });
         if (!messageId) throw new Error('Teams did not return the reply’s ID');
         return { messageId };
     }
 
     async update(channel: ChannelRef, rootId: string, messageId: string, content: OutboundContent) {
-        const ref = await this.#reference(channel.teamId);
-        const reference = this.#threadReference(ref, channel, rootId);
-        await this.#adapter.continueConversation(this.#identity, reference, async (context) => {
+        await this.#inThread(channel, rootId, async (context, reference) => {
             const activity = toActivity(content);
             activity.id = messageId;
             activity.conversation = reference.conversation;
@@ -152,14 +157,31 @@ export class TeamsPlatform implements ChannelPlatform {
     }
 
     async delete(channel: ChannelRef, rootId: string, messageId: string) {
-        const ref = await this.#reference(channel.teamId);
-        await this.#adapter.continueConversation(
-            this.#identity,
-            this.#threadReference(ref, channel, rootId),
-            async (context) => {
-                await context.deleteActivity(messageId);
+        await this.#inThread(channel, rootId, async (context) => {
+            await context.deleteActivity(messageId);
+        });
+    }
+
+    /**
+     * Runs `work` in a thread on Switchboard's own initiative. The adapter would hand an error to its turn error
+     * handler and return as if it had worked; here it reaches the caller, and a deleted message is recognisable.
+     */
+    async #inThread(
+        channel: ChannelRef,
+        rootId: string,
+        work: (context: TurnContext, reference: ConversationReference) => Promise<void>
+    ) {
+        const reference = this.#threadReference(await this.#reference(channel.teamId), channel, rootId);
+        let failure: unknown;
+        await this.#adapter.continueConversation(this.#identity, reference, async (context) => {
+            try {
+                await work(context, reference);
+            } catch (error) {
+                failure = error;
             }
-        );
+        });
+        if (failure === undefined) return;
+        throw isGone(failure) ? new MessageGoneError('the message was deleted in Teams') : failure;
     }
 
     async messageUrl(channel: ChannelRef, rootId: string, messageId: string) {

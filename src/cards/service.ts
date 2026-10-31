@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import type { SessionEvent } from '../claude/api.ts';
 import { channelOf } from '../conversations/conversations.ts';
-import type { CardJson, ChannelRef } from '../core/platform.ts';
+import { type CardJson, type ChannelRef, MessageGoneError } from '../core/platform.ts';
 import { cardHeader, type Person } from '../core/text.ts';
 import type { Card, SessionEntry } from '../store/entities.ts';
 import type { Switchboard } from '../switchboard.ts';
@@ -142,7 +142,9 @@ export class CardService {
         });
         if (problem) throw new CardError(problem);
         if (!updated) throw new CardError(`unknown card '${cardId}'`);
-        await this.#refresh(updated, true);
+        await this.#refresh(updated, true).catch((error: unknown) => {
+            throw error instanceof MessageGoneError ? new CardError('the card was deleted in Teams') : error;
+        });
     }
 
     /**
@@ -277,7 +279,9 @@ export class CardService {
             );
             if (!closed) continue;
             await this.#refresh(closed.value, false).catch((error: unknown) => {
-                sb.log.warn({ err: error, cardId: card.cardId }, 'closed card not updated in Teams');
+                if (error instanceof MessageGoneError)
+                    sb.log.debug({ cardId: card.cardId }, 'closed card deleted in Teams');
+                else sb.log.warn({ err: error, cardId: card.cardId }, 'closed card not updated in Teams');
             });
         }
     }

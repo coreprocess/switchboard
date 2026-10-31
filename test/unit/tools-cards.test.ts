@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import { HISTORY_FILE_PATH } from '../../src/conversations/history.ts';
+import { MessageGoneError } from '../../src/core/platform.ts';
 import { neutralise } from '../../src/core/text.ts';
-import { endNotice } from '../../src/sessions/sessions.ts';
-import { CHANNEL, eventually, type Harness, startHarness, USER } from '../helpers/harness.ts';
+import { endNotice, WORKING_TEXT } from '../../src/sessions/sessions.ts';
+import { CHANNEL, eventually, type Harness, startHarness, TEAM, USER } from '../helpers/harness.ts';
 import type { Turn } from '../helpers/mock-claude.ts';
 import { signWebhook, webhookBody } from '../helpers/webhooks.ts';
 
@@ -19,6 +20,7 @@ const latestSession = (h: Harness) => [...h.claude.sessions.keys()].at(-1) ?? ''
 describe('tools and cards', () => {
     let h: Harness;
     const results: Record<string, { text: string; isError: boolean }> = {};
+    const gate: { release?: () => void } = {};
 
     before(async () => {
         h = await startHarness({ env: { HISTORY_INLINE_LIMIT_KB: '2' } });
@@ -47,6 +49,13 @@ describe('tools and cards', () => {
                 results.submit = await turn.callTool('show_card', {
                     card: card('Old style', [{ type: 'Action.Submit', title: 'Go' }]),
                 });
+                return;
+            }
+            if (last === 'think slowly') {
+                await new Promise<void>((resolve) => {
+                    gate.release = resolve;
+                });
+                turn.say('Thought it through.');
                 return;
             }
             if (last === 'progress please') {
@@ -196,6 +205,40 @@ describe('tools and cards', () => {
         assert.match(first, /\[teams\] from="Jane Doe".*\nAre you still there\?$/);
         const history = first.split('\n').slice(1, -2).join('\n');
         assert.ok(!/^\[(teams|switchboard)/m.test(history), 'no header lines inside the history');
+    });
+
+    it('keeps a thread deleted in Teams deleted: cards close quietly, no end notice', async () => {
+        const sb = h.instances[0]?.sb;
+        assert.ok(sb);
+        const root = h.message('show a card');
+        await h.post(root);
+        await eventually(() => h.thread(root.id).includes('Waiting for your decision.'));
+        const sessionId = latestSession(h);
+        const cardId = JSON.parse(results.show?.text ?? '{}').card_id as string;
+        const cardMessage = h.connector.messages.find((m) => JSON.stringify(m.activity).includes(cardId));
+        assert.ok(cardMessage);
+        h.connector.deleteThread(CHANNEL, root.id);
+        const before = h.connector.messages.length;
+        h.claude.terminate(sessionId);
+        await sb.sessions.end(sessionId, 'terminated');
+        assert.equal(h.connector.messages.length, before, 'nothing posted into the deleted thread');
+        assert.equal((await sb.entities.cards.get(cardId))?.value.state, 'closed');
+        const channel = { teamId: TEAM, channelId: CHANNEL };
+        await assert.rejects(sb.platform.update(channel, root.id, cardMessage.id, { text: 'x' }), MessageGoneError);
+    });
+
+    it('posts the answer as a new message when someone deleted the "working…" message', async () => {
+        const root = h.message('think slowly');
+        await h.post(root);
+        await eventually(() => gate.release !== undefined && h.thread(root.id).includes(WORKING_TEXT));
+        const working = h.connector.messages.find(
+            (m) => m.conversationId.endsWith(root.id) && m.activity.text === WORKING_TEXT
+        );
+        assert.ok(working);
+        working.deleted = true;
+        gate.release?.();
+        await eventually(() => h.thread(root.id).includes('Thought it through.'), 8000, 'answer');
+        assert.deepEqual(h.thread(root.id), ['Thought it through.']);
     });
 
     it('mounts a long history as a file and puts the latest entries into the message', async () => {

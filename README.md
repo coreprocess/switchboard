@@ -90,7 +90,8 @@ The two deployments may use different agents. If both should share memory (for e
 - **Replies** go to the thread's owning session at once, also while it works. The platform queues a message behind earlier events; Switchboard posts every final answer when the session goes idle, so it works whether the message joins the running turn or starts the next one. Interrupting a turn is not part of v1.
 - **While the session works**, the thread shows one "⏳ Working…" message, which the final answer replaces. `send_update` posts appear at once; the "working" message moves below them.
 - **Final answers** (the last `agent.message` of a turn that ends with `end_turn`) are posted into the thread, split into Teams-sized messages. An empty final text posts nothing.
-- **When the session ends** (terminated, deleted, budget reached, unrecoverable error), its cards close for good and the thread gets a notice: "The next message starts a new session." The next message starts a continuation (below).
+- **When the session ends** (terminated, deleted, budget reached, unrecoverable error), its cards close for good and the thread gets a notice: "The next message starts a new session." The next message starts a continuation (below). A thread deleted in Teams gets no notice, so it stays deleted.
+- **Messages deleted in Teams:** if someone deletes the "working…" message, the answer is posted as a new message; `update_card` on a deleted card reports that.
 - **No special threads:** threads from before the binding, very old threads, threads Switchboard posted itself and threads whose entry was deleted after the retention period are all handled the same way; the history always comes from Teams.
 - **Ignored:** messages from Switchboard itself, edits and deletions (later histories show threads as they are).
 - **Unbound channels, personal and group chats:** only commands are handled; an @mention gets a short note that Switchboard is not set up there.
