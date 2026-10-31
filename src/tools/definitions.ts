@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { MAX_WAIT_MINUTES } from './waits.ts';
 
 /**
- * Switchboard's custom tools (concept: "Tools for agents"). Switchboard adds them to every session it creates;
+ * Switchboard's custom tools (README: "Tools for agents"). Switchboard adds them to every session it creates;
  * agent definitions stay free of them. They act in the session's own channel only.
  */
 

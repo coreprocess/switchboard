@@ -6,7 +6,7 @@ import type { Switchboard } from '../switchboard.ts';
 const WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Catches up on what streams and webhooks missed (concept: "Claude webhooks and reconciler"). Runs on every pod
+ * Catches up on what streams and webhooks missed (README: "Operations"). Runs on every pod
  * every 60 s with jitter and at start: active sessions with recent activity whose lease is free get followed
  * again when they have something to relay; ends that went unnoticed are handled. Also triggers the daily cleanup.
  */

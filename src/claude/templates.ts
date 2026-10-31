@@ -10,7 +10,7 @@ import { TOOL_NAMES, toolsFor } from '../tools/definitions.ts';
 import type { Agent, ClaudeWorkspaces, CreateSessionParams, Deployment } from './api.ts';
 
 /**
- * Deployments as templates (concept: "Creating sessions from the deployment template"). Switchboard reads a
+ * Deployments as templates (README: "Sessions from deployment templates"). Switchboard reads a
  * deployment and its agent in the version the deployment pins, and creates every session itself, with its own
  * system prompt appendix and tools added. It never runs a deployment.
  */

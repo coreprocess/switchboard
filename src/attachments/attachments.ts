@@ -3,7 +3,7 @@ import type { ContentBlock } from '../claude/templates.ts';
 import type { Switchboard } from '../switchboard.ts';
 
 /**
- * Attachments of incoming messages (concept: "Attachments"): one handler per type. v1 passes images on; other
+ * Attachments of incoming messages (README: "Attachments"): one handler per type. v1 passes images on; other
  * types are named in a line for the agent and once in the thread, so further handlers fit in without changing
  * the data model or the message formats.
  */

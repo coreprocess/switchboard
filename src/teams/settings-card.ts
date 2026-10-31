@@ -4,7 +4,7 @@ import type { CardJson } from '../core/platform.ts';
 import { clip } from '../core/text.ts';
 import type { Binding, Job } from '../store/entities.ts';
 
-/** Switchboard's own card for bindings and jobs (concept: "Commands and the settings card"). */
+/** Switchboard's own card for bindings and jobs (README: "Commands"). */
 
 export const SETTINGS_DATA_KEY = 'switchboard_settings';
 export const VERB_SAVE = 'switchboard.settings.save';

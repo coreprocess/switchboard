@@ -8,7 +8,7 @@ import type { Switchboard } from '../switchboard.ts';
 const SHORT_LIVED_DAYS = 7;
 
 /**
- * The daily cleanup (concept: "Lifecycle: archive and delete"). Claude keeps sessions until they are deleted, so
+ * The daily cleanup (README: "Lifecycle"). Claude keeps sessions until they are deleted, so
  * Switchboard archives inactive conversations' sessions and, after the retention period, deletes the sessions,
  * the files it uploaded and its augmentation of the thread. The thread itself stays in Teams; a later reply is
  * handled like any other. Exactly one pod runs it per day (claimed like a job tick).

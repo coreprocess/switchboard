@@ -267,7 +267,7 @@ export class Delivery {
 
     /**
      * The first message of a new session. A new root post arrives on its own; in every other case the thread has
-     * content already, which comes first, read from Teams (concept: "Message formats").
+     * content already, which comes first, read from Teams (README: "Message formats").
      */
     async #firstMessage(binding: Binding, conversation: Conversation, trigger: Trigger): Promise<FirstMessage> {
         const sb = this.#sb;

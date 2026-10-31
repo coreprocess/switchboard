@@ -33,7 +33,7 @@ const PRIVATE_CHANNEL_NOTE =
     'This channel is not in the team’s list of standard channels (private or shared?). Teams may not deliver ' +
     'messages without an @mention from such channels to apps yet; mention Switchboard to be sure.';
 
-/** Bindings, jobs and the commands (concept: "Admins and access", "Commands and the settings card"). */
+/** Bindings, jobs and the commands (README: "Commands", "Commands and the settings card"). */
 export class ChannelAdmin {
     readonly #sb: Switchboard;
     readonly #teams: TeamsPlatform;
@@ -231,7 +231,7 @@ export class ChannelAdmin {
             .catch(() => undefined);
     }
 
-    /** `upgrade`: moves the channel's deployments to the newest agent versions (concept: "Upgrading"). */
+    /** `upgrade`: moves the channel's deployments to the newest agent versions (README: "Upgrading a channel's agents"). */
     async upgrade(binding: Binding, job: Job | undefined): Promise<string> {
         const sb = this.#sb;
         const targets = [

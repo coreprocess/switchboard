@@ -41,7 +41,7 @@ interface Follower {
 }
 
 /**
- * Follows sessions that are working (concept: "Several pods on Table Storage"). One pod follows a session at a
+ * Follows sessions that are working (README: "Operations"). One pod follows a session at a
  * time, holding the session lease in the store (renewed every 20 s, valid for 60 s). The holder drains the
  * session's events from the stored watermark: it answers custom tool calls, posts final answers and handles
  * pauses and ends. A session waiting only for a person or for the end of a `wait` holds no lease.

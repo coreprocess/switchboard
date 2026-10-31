@@ -4,7 +4,7 @@ import type { Query } from '../store/store.ts';
 import type { Switchboard } from '../switchboard.ts';
 
 /**
- * The `wait` tool (concept: "Waiting"): a session pauses until its deadline, a new message in a conversation it
+ * The `wait` tool (README: "Conversations across the channel"): a session pauses until its deadline, a new message in a conversation it
  * watches, or something for itself. A waiting call is a stored tool call with status `waiting`; the session holds
  * no lease meanwhile. Every pod's timer answers due waits, and the pod that sees a message answers the waits on
  * its conversation. Each wait is answered once: the change from `waiting` to `done` is a conditional write.

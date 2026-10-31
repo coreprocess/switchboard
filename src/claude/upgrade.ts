@@ -7,7 +7,7 @@ import type { Agent, ClaudeApi } from './api.ts';
 import type { SessionKind, Templates } from './templates.ts';
 
 /**
- * `upgrade` (concept: "Upgrading a channel's agents"): deployments pin a fixed agent version, and agents pin fixed
+ * `upgrade` (README: "Upgrading a channel's agents"): deployments pin a fixed agent version, and agents pin fixed
  * versions of the agents they use as subagents or in workflows; only skills follow "latest". The upgrade moves a
  * channel's deployments to their agents' newest versions. Where an agent references an outdated version of another
  * agent, it first saves a new version of that agent with the references raised, inside out, and otherwise unchanged.

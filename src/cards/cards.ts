@@ -2,7 +2,7 @@ import type { CardJson } from '../core/platform.ts';
 import { clip } from '../core/text.ts';
 
 /**
- * Agent cards (concept: "Cards"): Switchboard passes an agent's Adaptive Card through unchanged, except that every
+ * Agent cards (README: "Cards"): Switchboard passes an agent's Adaptive Card through unchanged, except that every
  * `Action.Execute` gets `switchboard_card: <card id>` in its data so clicks reach Switchboard. It renders the
  * locked and closed states itself, and the generic confirmation card for tools set to "always ask".
  */

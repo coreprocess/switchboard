@@ -21,7 +21,7 @@ interface ToolResult {
 export type CallState = 'answered' | 'waiting' | 'pending';
 
 /**
- * Carries out Switchboard's custom tools (concept: "Tools for agents"). Each call is carried out at most once:
+ * Carries out Switchboard's custom tools (README: "Tools for agents"). Each call is carried out at most once:
  * its event ID is inserted before it runs and its result is stored, so a pod that takes over a session answers
  * pending calls from the stored result instead of repeating them.
  */

@@ -1,6 +1,6 @@
 /**
  * Text that crosses the trust boundary between Teams and agents: the header lines Switchboard puts in front of
- * every part of a message it writes (concept: "Message formats"), neutralising human text so only Switchboard can
+ * every part of a message it writes (README: "Message formats"), neutralising human text so only Switchboard can
  * produce such lines, and splitting long answers.
  */
 

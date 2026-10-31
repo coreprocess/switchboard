@@ -32,7 +32,7 @@ export const nextRun = (job: Pick<Job, 'cron' | 'timezone'>, after: Date): Date 
     new Cron(job.cron, { timezone: job.timezone, paused: true }).nextRun(after) ?? undefined;
 
 /**
- * Jobs (concept: "Jobs"): every pod runs the timer; each tick is claimed by inserting its run entry, so exactly
+ * Jobs (README: "Jobs"): every pod runs the timer; each tick is claimed by inserting its run entry, so exactly
  * one pod starts it. One run per job is active at a time (conditional write on the job's `activeRun`). Ticks
  * missed while no pod ran are not caught up. The deployment's budget limits a run's cost and work; the
  * instance-wide `JOB_MAX_RUNTIME_HOURS` only frees a job whose run got stuck, so later ticks can start again.
