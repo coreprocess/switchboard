@@ -29,6 +29,8 @@ WORKDIR /app
 COPY --from=deps /app/package.json ./
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+# Switchboard's system prompt appendix, read at start (src/claude/templates.ts)
+COPY prompt ./prompt
 # numeric, so Kubernetes can verify runAsNonRoot (distroless' nonroot user)
 USER 65532:65532
 EXPOSE 8080

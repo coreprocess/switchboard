@@ -1,10 +1,8 @@
 /**
- * Text that crosses the trust boundary between Teams and agents: the header Switchboard puts in front of every
- * human message, the approval marker only Switchboard may produce, and splitting long replies.
+ * Text that crosses the trust boundary between Teams and agents: the header lines Switchboard puts in front of
+ * every part of a message it writes (concept: "Message formats"), neutralising human text so only Switchboard can
+ * produce such lines, and splitting long answers.
  */
-
-/** First token of the machine-readable approval message (concept: approvals). */
-export const APPROVAL_MARKER = '[switchboard:approval]';
 
 /** Teams allows ~28 KB per message including markup; this leaves room for formatting. */
 export const MAX_MESSAGE_CHARS = 12_000;
@@ -16,58 +14,49 @@ const INVISIBLE = /\p{Default_Ignorable_Code_Point}/gu;
 const RESERVED = /\[\s*(switchboard\s*[:\]]|teams\s*\])/gi;
 
 /**
- * Makes human text safe to pass to an agent: no reserved token survives, so a human can neither fake an approval
- * marker nor a second Switchboard header. NFKC folds look-alikes such as fullwidth brackets first.
+ * Makes human text safe to pass to an agent: a reserved token becomes `[user-typed …`, so a human can never write
+ * a Switchboard header line. NFKC folds look-alikes such as fullwidth brackets first.
  */
 export const neutralise = (text: string): string =>
     text.normalize('NFKC').replace(INVISIBLE, '').replace(RESERVED, '[user-typed $1');
 
-/** A display name as it may appear inside a header or marker line: one line, no brackets or quotes. */
-export const sanitiseName = (name: string | undefined): string => {
-    const cleaned = neutralise(name ?? '')
-        .replace(/[\r\n\t"[\]()<>]/g, ' ')
+/** A quoted header value: one line, neutralised, quotes and backslashes escaped. */
+export const quoted = (value: string | undefined): string => {
+    const line = neutralise(value ?? '')
+        .replace(/\p{Cc}/gu, ' ')
         .replace(/\s+/g, ' ')
         .trim()
-        .slice(0, 100);
-    return cleaned || 'unknown';
+        .slice(0, 200);
+    return `"${(line || 'unknown').replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 };
 
-export interface HumanMessage {
-    channelKey: string;
-    threadId: string;
+/** A bare header value (IDs, reasons, verbs): no whitespace or quotes. */
+const bare = (value: string) => value.replace(/[\s"]+/g, '_').slice(0, 200) || '-';
+
+export interface Person {
     name: string | undefined;
     aadObjectId: string;
-    at: Date;
-    text: string;
 }
 
-/** The text sent to the agent for a human message: one Switchboard header line, then the neutralised text. */
-export const formatHumanMessage = (message: HumanMessage): string =>
-    `[teams] from: ${sanitiseName(message.name)} (${message.aadObjectId}) at ${message.at.toISOString()} ` +
-    `channel: ${message.channelKey} thread: ${message.threadId}\n${neutralise(message.text)}`;
+export const teamsHeader = (from: Person, at: Date) =>
+    `[teams] from=${quoted(from.name)} aad=${bare(from.aadObjectId)} at=${at.toISOString()}`;
 
-export interface ApprovalDecision {
-    cardId: string;
-    decision: 'approved' | 'denied';
-    name: string | undefined;
-    aadObjectId: string;
-    at: Date;
-}
+/** A human message: the header, then the neutralised text. */
+export const formatHumanMessage = (from: Person, at: Date, text: string) =>
+    `${teamsHeader(from, at)}\n${neutralise(text)}`;
 
-/** The fixed, machine-readable message an agent receives for a decided approval card. */
-export const formatApprovalMarker = (decision: ApprovalDecision): string =>
-    `${APPROVAL_MARKER} card=${decision.cardId} decision=${decision.decision} ` +
-    `by="${sanitiseName(decision.name)}" aad=${decision.aadObjectId} at=${decision.at.toISOString()}`;
+export const conversationStartHeader = (fromSession: string, postedAt: Date) =>
+    `[switchboard:conversation-start] from_session=${bare(fromSession)} posted_at=${postedAt.toISOString()}`;
 
-/** First non-empty line, shortened, for session titles. */
-export const firstLine = (text: string, max: number): string => {
-    const line =
-        text
-            .split('\n')
-            .map((l) => l.trim())
-            .find((l) => l.length > 0) ?? '';
-    return line.length > max ? `${line.slice(0, max - 1)}…` : line;
-};
+export const continuationHeader = (previousSession: string, reason: string, at: Date) =>
+    `[switchboard:continuation] previous_session=${bare(previousSession)} reason=${bare(reason)} at=${at.toISOString()}`;
+
+export const jobFailedHeader = (reason: string, at: Date) =>
+    `[switchboard:job-failed] reason=${bare(reason)} at=${at.toISOString()}`;
+
+export const cardHeader = (cardId: string, verb: string, by: Person, at: Date) =>
+    `[switchboard:card] card=${bare(cardId)} verb=${bare(verb)} by=${quoted(by.name)} aad=${bare(by.aadObjectId)} ` +
+    `at=${at.toISOString()}`;
 
 /** Splits text into messages of at most `max` characters, preferring paragraph, then line, then word breaks. */
 export const splitMessage = (text: string, max = MAX_MESSAGE_CHARS): string[] => {
@@ -86,5 +75,13 @@ export const splitMessage = (text: string, max = MAX_MESSAGE_CHARS): string[] =>
     return chunks;
 };
 
-/** Shortens untrusted text for display (card fields, notices). */
+/** Shortens text for display or storage. */
 export const clip = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
+
+/** Shortens text to at most `maxBytes` UTF-8 bytes. */
+export const clipBytes = (text: string, maxBytes: number): string => {
+    if (Buffer.byteLength(text) <= maxBytes) return text;
+    let end = Math.min(text.length, maxBytes);
+    while (end > 0 && Buffer.byteLength(text.slice(0, end)) > maxBytes - 3) end--;
+    return `${text.slice(0, end)}…`;
+};

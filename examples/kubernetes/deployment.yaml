@@ -1,14 +1,17 @@
-# Exactly one replica: Switchboard holds live session streams in memory. Recreate, so an old and a new pod never
-# run at the same time; the reconciler catches up on anything missed during the switch.
+# Several pods: all state and coordination live in Table Storage, any pod handles any request, and a pod that
+# goes away hands its session leases over (another pod takes them within a minute). Rolling updates are fine.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: switchboard
   namespace: switchboard
 spec:
-  replicas: 1
+  replicas: 2
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: switchboard
@@ -20,6 +23,7 @@ spec:
     spec:
       serviceAccountName: switchboard
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -28,22 +32,17 @@ spec:
           type: RuntimeDefault
       containers:
         - name: switchboard
-          image: ghcr.io/coreprocess/switchboard:0.1.0
+          image: ghcr.io/coreprocess/switchboard:1.0.0
           ports:
             - name: http
               containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: switchboard
+            - secretRef:
+                name: switchboard
           env:
-            - name: SWITCHBOARD_CONFIG
-              value: /etc/switchboard/channels.yaml
-            - name: SWITCHBOARD_PUBLIC_URL
-              value: https://switchboard.example.com
-            - name: STORE_KIND
-              value: azure-tables
-            - name: STORE_TABLES_ENDPOINT
-              value: https://<storage account>.table.core.windows.net
-            - name: LOG_LEVEL
-              value: info
-            # Teams sign-in through workload identity: the bot's app registration, no secret.
+            # Teams sign-in (and Graph) as the bot's app registration, through workload identity: no secret.
             - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHTYPE
               value: WorkloadIdentity
             - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID
@@ -56,33 +55,28 @@ spec:
               value: /var/run/secrets/azure/tokens/azure-identity-token
             - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__SCOPE
               value: https://api.botframework.com
-            # Claude API sign-in through Workload Identity Federation: the projected token below, no API key.
+            # Claude sign-in: the SDK exchanges this projected token per workspace (SWITCHBOARD_WORKSPACES)
             - name: ANTHROPIC_IDENTITY_TOKEN_FILE
               value: /var/run/secrets/anthropic.com/token
-            - name: ANTHROPIC_FEDERATION_RULE_ID
-              value: fdrl_xxx
-            - name: ANTHROPIC_ORGANIZATION_ID
-              value: "00000000-0000-0000-0000-000000000000"
-            - name: ANTHROPIC_SERVICE_ACCOUNT_ID
-              value: svac_xxx
-            - name: ANTHROPIC_WORKSPACE_ID
-              value: wrkspc_xxx
-          envFrom:
-            - secretRef:
-                name: switchboard
           volumeMounts:
-            - name: channels
-              mountPath: /etc/switchboard
-              readOnly: true
             - name: anthropic-token
               mountPath: /var/run/secrets/anthropic.com
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
           livenessProbe:
             httpGet:
               path: /healthz
               port: http
             periodSeconds: 20
           readinessProbe:
+            # ready only while Table Storage answers
             httpGet:
               path: /readyz
               port: http
@@ -90,7 +84,7 @@ spec:
           resources:
             requests:
               cpu: 50m
-              memory: 128Mi
+              memory: 192Mi
             limits:
               memory: 512Mi
           securityContext:
@@ -99,10 +93,7 @@ spec:
             capabilities:
               drop: [ "ALL" ]
       volumes:
-        - name: channels
-          configMap:
-            name: switchboard-channels
-        # Anthropic accepts each token once; the kubelet replaces it at 80% of its lifetime, so the SDK finds a new
+        # Claude accepts each token once; the kubelet replaces it at 80% of its lifetime, so the SDK finds a new
         # one at every refresh (federation rule token lifetime 3600 s). A container restart in the same pod waits
         # for the next replacement (up to about 8 minutes); a new pod starts with a fresh token.
         - name: anthropic-token
@@ -112,3 +103,5 @@ spec:
                   audience: https://api.anthropic.com
                   expirationSeconds: 600
                   path: token
+        - name: tmp
+          emptyDir: {}

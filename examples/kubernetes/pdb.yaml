@@ -1,0 +1,11 @@
+# Keeps at least one pod while nodes are drained; any pod can take over another's sessions.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: switchboard
+  namespace: switchboard
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: switchboard

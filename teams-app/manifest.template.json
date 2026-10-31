@@ -27,7 +27,26 @@
             "botId": "{{BOT_ID}}",
             "scopes": ["team"],
             "supportsFiles": false,
-            "isNotificationOnly": false
+            "isNotificationOnly": false,
+            "commandLists": [
+                {
+                    "scopes": ["team"],
+                    "commands": [
+                        {
+                            "title": "settings",
+                            "description": "Admins: connect this channel to a deployment and set up its job"
+                        },
+                        {
+                            "title": "status",
+                            "description": "Show the channel's deployments, job and active conversations"
+                        },
+                        { "title": "pause", "description": "Admins: turn the channel's job off" },
+                        { "title": "resume", "description": "Admins: turn the channel's job on" },
+                        { "title": "run", "description": "Admins: start a job run now" },
+                        { "title": "disconnect", "description": "Admins: disconnect Switchboard from this channel" }
+                    ]
+                }
+            ]
         }
     ],
     "validDomains": [],

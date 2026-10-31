@@ -53,10 +53,10 @@ Squash-merge and direct-push commits to `main` MUST follow:
 **Example:**
 
 ```
-[feature] Expire approval cards after a configurable time
+[feature] Archive inactive conversations after a configurable time
 
-Cards left open for days were approved against a state that no longer
-existed; approval_expiry_hours lets a deployment close them.
+Idle sessions never end on their own, so Teams content stayed in Claude
+longer than in Switchboard; SESSION_ARCHIVE_AFTER_DAYS bounds it.
 ```
 
 ### Version tags
@@ -73,7 +73,7 @@ git describe --tags --candidates=100 --match='v[0-9]*' --abbrev=4
 
 Pushing a tag triggers the release pipeline, which builds the image `ghcr.io/coreprocess/switchboard:<major>.<minor>.<patch>` (and `:<major>.<minor>`) and embeds the version as `SWITCHBOARD_VERSION`. Consuming projects pin the image by version or digest.
 
-The configuration (environment variables, channels file), the MCP tool interface, the message formats agents see (the `[teams]` header, the approval marker) and the HTTP endpoints are the public contract. Breaking any of them is a major change.
+The configuration (environment variables), the custom tools agents get (names, inputs, results), the header lines agents see (`[teams]`, `[switchboard:…]`), the commands and the HTTP endpoints are the public contract. Breaking any of them is a major change.
 
 ---
 

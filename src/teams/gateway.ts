@@ -1,19 +1,23 @@
 import { Activity, type ConversationReference } from '@microsoft/agents-activity';
 import { CloudAdapter } from '@microsoft/agents-hosting';
-import type { ChannelsConfig } from '../config/channels.ts';
-import type { ChannelGateway, OutboundContent } from '../core/gateway.ts';
-import type { ConversationRecord, Store } from '../store/store.ts';
-import { splitConversationId } from './access.ts';
+import { z } from 'zod';
+import type { ChannelGateway, ChannelRef, OutboundContent } from '../core/gateway.ts';
+import type { Entities, TeamsRef } from '../store/entities.ts';
+import { splitConversationId } from './activity.ts';
 
-const BOT_FRAMEWORK_AUDIENCE = 'https://api.botframework.com';
+const BOT_FRAMEWORK_SCOPE = 'https://api.botframework.com';
 const ADAPTIVE_CARD = 'application/vnd.microsoft.card.adaptive';
+
+/** Hosts Teams serves attachment content from; nothing else is fetched with the bot's token. */
+const ATTACHMENT_HOSTS = [/^smba\.trafficmanager\.net$/, /\.botframework\.com$/, /\.asm\.skype\.com$/];
 
 export interface TeamsGatewayOptions {
     adapter: CloudAdapter;
-    store: Store;
-    config: ChannelsConfig;
+    entities: Entities;
     /** The bot's app ID (Entra app registration); empty only in local anonymous mode. */
     botAppId: string;
+    /** Hosts attachments may be downloaded from (tests); Microsoft's hosts by default, HTTPS only. */
+    attachmentHosts?: RegExp[];
 }
 
 export const toActivity = (content: OutboundContent): Activity =>
@@ -23,59 +27,47 @@ export const toActivity = (content: OutboundContent): Activity =>
             : { type: 'message', text: content.text, textFormat: 'markdown' }
     );
 
-/** Link to a channel message in the Teams client. */
-export const messageUrl = (ref: ConversationRecord, rootId: string, messageId: string) => {
-    const params = new URLSearchParams({ tenantId: ref.tenantId, parentMessageId: rootId });
-    if (ref.aadGroupId) params.set('groupId', ref.aadGroupId);
-    return `https://teams.microsoft.com/l/message/${encodeURIComponent(ref.channelId)}/${messageId}?${params}`;
-};
+const TeamDetails = z.looseObject({ id: z.string(), name: z.string().nullish(), aadGroupId: z.string().nullish() });
+const TeamChannels = z.looseObject({
+    conversations: z.array(z.looseObject({ id: z.string(), name: z.string().nullish() })),
+});
 
-/** Posts into bound Teams channels proactively, with the conversation reference stored for each channel. */
+/** Teams behind the platform boundary: posting into channels proactively, team details, attachment downloads. */
 export class TeamsGateway implements ChannelGateway {
     readonly #adapter: CloudAdapter;
-    readonly #store: Store;
-    readonly #config: ChannelsConfig;
+    readonly #entities: Entities;
     readonly #botAppId: string;
     /** `{ aud: <app id> }`, what the adapter derives from the app ID; also valid in anonymous development mode. */
     readonly #identity: ReturnType<typeof CloudAdapter.createIdentity>;
+    readonly #attachmentHosts: RegExp[] | undefined;
 
     constructor(options: TeamsGatewayOptions) {
+        this.#attachmentHosts = options.attachmentHosts;
         this.#adapter = options.adapter;
-        this.#store = options.store;
-        this.#config = options.config;
+        this.#entities = options.entities;
         this.#botAppId = options.botAppId;
         this.#identity = CloudAdapter.createIdentity(options.botAppId);
     }
 
-    async #reference(channelKey: string): Promise<ConversationRecord> {
-        const channel = this.#config.channels[channelKey];
-        if (!channel) throw new Error(`unknown channel '${channelKey}'`);
-        const stored = await this.#store.getConversation(channelKey);
-        if (stored) return stored;
-        if (!this.#config.service_url) {
-            throw new Error(
-                `no conversation reference for channel '${channelKey}' yet: add the app to the team or mention the bot once`
-            );
-        }
-        return {
-            channelKey,
-            serviceUrl: this.#config.service_url,
-            tenantId: this.#config.tenant_id,
-            channelId: channel.channel_id,
-            teamId: channel.team_id,
-            aadGroupId: channel.team_aad_group_id,
-            botId: `28:${this.#botAppId}`,
-            updatedAt: new Date().toISOString(),
-        };
+    /** A token of the bot's app registration (workload identity); `undefined` in anonymous development mode. */
+    async token(scope: string): Promise<string | undefined> {
+        if (!this.#botAppId) return undefined;
+        return this.#adapter.connectionManager.getDefaultConnection().getAccessToken(scope);
     }
 
-    #threadReference(ref: ConversationRecord, rootId: string): ConversationReference {
+    async #reference(teamId: string): Promise<TeamsRef> {
+        const ref = (await this.#entities.teamsRefs.get(teamId))?.value;
+        if (!ref) throw new Error('Switchboard has not seen this team yet: add the app to the team or mention it once');
+        return ref;
+    }
+
+    #threadReference(ref: TeamsRef, channel: ChannelRef, rootId: string): ConversationReference {
         return {
             channelId: 'msteams',
             serviceUrl: ref.serviceUrl,
             agent: { id: ref.botId },
             conversation: {
-                id: `${ref.channelId};messageid=${rootId}`,
+                id: `${channel.channelId};messageid=${rootId}`,
                 isGroup: true,
                 conversationType: 'channel',
                 tenantId: ref.tenantId,
@@ -83,19 +75,19 @@ export class TeamsGateway implements ChannelGateway {
         };
     }
 
-    async postTopLevel(channelKey: string, content: OutboundContent) {
-        const ref = await this.#reference(channelKey);
+    async postThread(channel: ChannelRef, content: OutboundContent) {
+        const ref = await this.#reference(channel.teamId);
         let conversationId: string | undefined;
         await this.#adapter.createConversationAsync(
             this.#botAppId,
             'msteams',
             ref.serviceUrl,
-            BOT_FRAMEWORK_AUDIENCE,
+            BOT_FRAMEWORK_SCOPE,
             {
                 isGroup: true,
                 agent: { id: ref.botId },
                 tenantId: ref.tenantId,
-                channelData: { channel: { id: ref.channelId }, tenant: { id: ref.tenantId } },
+                channelData: { channel: { id: channel.channelId }, tenant: { id: ref.tenantId } },
                 activity: toActivity(content),
             },
             async (context) => {
@@ -103,27 +95,27 @@ export class TeamsGateway implements ChannelGateway {
             }
         );
         const rootId = conversationId ? splitConversationId(conversationId).rootId : undefined;
-        if (!rootId) throw new Error(`Teams did not return the new thread's ID (conversation '${conversationId}')`);
-        return { rootId, url: messageUrl(ref, rootId, rootId) };
+        if (!rootId) throw new Error('Teams did not return the new thread’s ID');
+        return { rootId, url: await this.messageUrl(channel, rootId, rootId) };
     }
 
-    async reply(channelKey: string, rootId: string, content: OutboundContent) {
-        const ref = await this.#reference(channelKey);
+    async reply(channel: ChannelRef, rootId: string, content: OutboundContent) {
+        const ref = await this.#reference(channel.teamId);
         let messageId: string | undefined;
         await this.#adapter.continueConversation(
             this.#identity,
-            this.#threadReference(ref, rootId),
+            this.#threadReference(ref, channel, rootId),
             async (context) => {
                 messageId = (await context.sendActivity(toActivity(content)))?.id;
             }
         );
-        if (!messageId) throw new Error('Teams did not return the reply ID');
+        if (!messageId) throw new Error('Teams did not return the reply’s ID');
         return { messageId };
     }
 
-    async update(channelKey: string, rootId: string, messageId: string, content: OutboundContent) {
-        const ref = await this.#reference(channelKey);
-        const reference = this.#threadReference(ref, rootId);
+    async update(channel: ChannelRef, rootId: string, messageId: string, content: OutboundContent) {
+        const ref = await this.#reference(channel.teamId);
+        const reference = this.#threadReference(ref, channel, rootId);
         await this.#adapter.continueConversation(this.#identity, reference, async (context) => {
             const activity = toActivity(content);
             activity.id = messageId;
@@ -132,14 +124,72 @@ export class TeamsGateway implements ChannelGateway {
         });
     }
 
-    async delete(channelKey: string, rootId: string, messageId: string) {
-        const ref = await this.#reference(channelKey);
+    async delete(channel: ChannelRef, rootId: string, messageId: string) {
+        const ref = await this.#reference(channel.teamId);
         await this.#adapter.continueConversation(
             this.#identity,
-            this.#threadReference(ref, rootId),
+            this.#threadReference(ref, channel, rootId),
             async (context) => {
                 await context.deleteActivity(messageId);
             }
         );
+    }
+
+    async messageUrl(channel: ChannelRef, rootId: string, messageId: string) {
+        const ref = (await this.#entities.teamsRefs.get(channel.teamId))?.value;
+        const params = new URLSearchParams({ parentMessageId: rootId });
+        if (ref) params.set('tenantId', ref.tenantId);
+        if (ref?.aadGroupId) params.set('groupId', ref.aadGroupId);
+        return `https://teams.microsoft.com/l/message/${encodeURIComponent(channel.channelId)}/${messageId}?${params}`;
+    }
+
+    async #botFramework(ref: TeamsRef, path: string): Promise<unknown> {
+        const token = await this.token(BOT_FRAMEWORK_SCOPE);
+        const response = await fetch(
+            new URL(path, ref.serviceUrl.endsWith('/') ? ref.serviceUrl : `${ref.serviceUrl}/`),
+            {
+                headers: token ? { authorization: `Bearer ${token}` } : {},
+            }
+        );
+        if (!response.ok) throw new Error(`Bot Framework ${path}: HTTP ${response.status}`);
+        return response.json();
+    }
+
+    /** The team's name and Microsoft 365 group ID (Graph needs the group ID). */
+    async teamDetails(teamId: string): Promise<{ name: string | undefined; aadGroupId: string | undefined }> {
+        const ref = await this.#reference(teamId);
+        const details = TeamDetails.parse(await this.#botFramework(ref, `v3/teams/${encodeURIComponent(teamId)}`));
+        return { name: details.name ?? undefined, aadGroupId: details.aadGroupId ?? undefined };
+    }
+
+    /**
+     * The channel's display name (the General channel has none in the API), and whether the team's channel list
+     * shows it: private and shared channels are missing there.
+     */
+    async channelInfo(teamId: string, channelId: string): Promise<{ name: string | undefined; listed: boolean }> {
+        const ref = await this.#reference(teamId);
+        const channels = TeamChannels.parse(
+            await this.#botFramework(ref, `v3/teams/${encodeURIComponent(teamId)}/conversations`)
+        );
+        const channel = channels.conversations.find((c) => c.id === channelId);
+        if (!channel) return { name: undefined, listed: false };
+        return { name: channel.name ?? (channelId === teamId ? 'General' : undefined), listed: true };
+    }
+
+    /** Downloads an attachment Teams serves with the bot's token; other hosts are refused. */
+    async download(contentUrl: string): Promise<{ data: Uint8Array; mediaType: string | undefined }> {
+        const url = new URL(contentUrl);
+        const hosts = this.#attachmentHosts ?? ATTACHMENT_HOSTS;
+        const secure = url.protocol === 'https:' || this.#attachmentHosts !== undefined;
+        if (!secure || !hosts.some((host) => host.test(url.hostname))) {
+            throw new Error(`attachment host ${url.hostname} is not allowed`);
+        }
+        const token = await this.token(BOT_FRAMEWORK_SCOPE);
+        const response = await fetch(url, { headers: token ? { authorization: `Bearer ${token}` } : {} });
+        if (!response.ok) throw new Error(`attachment download: HTTP ${response.status}`);
+        return {
+            data: new Uint8Array(await response.arrayBuffer()),
+            mediaType: response.headers.get('content-type') ?? undefined,
+        };
     }
 }

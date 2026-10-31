@@ -1,101 +1,63 @@
-import type {
-    ApprovalDecisionUpdate,
-    ApprovalRecord,
-    ConversationRecord,
-    DecisionResult,
-    SessionRecord,
-    Store,
-    ThreadLink,
-} from './store.ts';
+import { matches, type Query, type Row, type Store, type StoredRow, type TableName } from './store.ts';
 
-/** In-process store for tests and local development; state is lost on restart. */
+/** In-memory store for tests and local development. Several Switchboard instances may share one. */
 export class MemoryStore implements Store {
-    readonly #threads = new Map<string, ThreadLink>();
-    readonly #sessions = new Map<string, SessionRecord>();
-    readonly #approvals = new Map<string, ApprovalRecord>();
-    readonly #conversations = new Map<string, ConversationRecord>();
-    readonly #webhookEvents = new Map<string, string>();
+    readonly #tables = new Map<TableName, Map<string, StoredRow>>();
+    #version = 0;
 
-    async init(): Promise<void> {
+    #table(table: TableName) {
+        let rows = this.#tables.get(table);
+        if (!rows) {
+            rows = new Map();
+            this.#tables.set(table, rows);
+        }
+        return rows;
+    }
+
+    #write(table: TableName, partitionKey: string, rowKey: string, row: Row): StoredRow {
+        const stored = { partitionKey, rowKey, etag: `v${++this.#version}`, row: { ...row } };
+        this.#table(table).set(JSON.stringify([partitionKey, rowKey]), stored);
+        return { ...stored, row: { ...stored.row } };
+    }
+
+    async init() {
         // nothing to create
     }
 
-    async ping(): Promise<void> {
+    async ping() {
         // always reachable
     }
 
-    async getThread(channelKey: string, rootId: string) {
-        return copy(this.#threads.get(`${channelKey}/${rootId}`));
+    async get(table: TableName, partitionKey: string, rowKey: string) {
+        const stored = this.#table(table).get(JSON.stringify([partitionKey, rowKey]));
+        return stored ? { ...stored, row: { ...stored.row } } : undefined;
     }
 
-    async putThread(link: ThreadLink) {
-        this.#threads.set(`${link.channelKey}/${link.rootId}`, { ...link });
+    async insert(table: TableName, partitionKey: string, rowKey: string, row: Row) {
+        if (this.#table(table).has(JSON.stringify([partitionKey, rowKey]))) return undefined;
+        return this.#write(table, partitionKey, rowKey, row);
     }
 
-    async getSession(sessionId: string) {
-        return copy(this.#sessions.get(sessionId));
+    async update(table: TableName, current: StoredRow, row: Row) {
+        const existing = this.#table(table).get(JSON.stringify([current.partitionKey, current.rowKey]));
+        if (!existing || existing.etag !== current.etag) return undefined;
+        return this.#write(table, current.partitionKey, current.rowKey, row);
     }
 
-    async putSession(record: SessionRecord) {
-        this.#sessions.set(record.sessionId, { ...record });
+    async upsert(table: TableName, partitionKey: string, rowKey: string, row: Row) {
+        this.#write(table, partitionKey, rowKey, row);
     }
 
-    async listSessionsUpdatedSince(since: string) {
-        return [...this.#sessions.values()].filter((s) => s.updatedAt >= since).map((s) => ({ ...s }));
+    async delete(table: TableName, partitionKey: string, rowKey: string, etag?: string) {
+        const key = JSON.stringify([partitionKey, rowKey]);
+        const existing = this.#table(table).get(key);
+        if (!existing || (etag !== undefined && existing.etag !== etag)) return false;
+        return this.#table(table).delete(key);
     }
 
-    async createApproval(record: ApprovalRecord) {
-        if (this.#approvals.has(record.cardId)) return false;
-        this.#approvals.set(record.cardId, { ...record, steps: [...record.steps] });
-        return true;
-    }
-
-    async getApproval(cardId: string) {
-        const record = this.#approvals.get(cardId);
-        return record ? { ...record, steps: [...record.steps] } : undefined;
-    }
-
-    async setApprovalMessageId(cardId: string, messageId: string) {
-        const record = this.#approvals.get(cardId);
-        if (record) record.messageId = messageId;
-    }
-
-    async decideApproval(cardId: string, update: ApprovalDecisionUpdate): Promise<DecisionResult | undefined> {
-        const record = this.#approvals.get(cardId);
-        if (!record) return undefined;
-        if (record.status !== 'pending') return { applied: false, record: { ...record, steps: [...record.steps] } };
-        Object.assign(record, update);
-        return { applied: true, record: { ...record, steps: [...record.steps] } };
-    }
-
-    async getConversation(channelKey: string) {
-        return copy(this.#conversations.get(channelKey));
-    }
-
-    async putConversation(record: ConversationRecord) {
-        this.#conversations.set(record.channelKey, { ...record });
-    }
-
-    async claimWebhookEvent(eventId: string, at: string) {
-        if (this.#webhookEvents.has(eventId)) return false;
-        this.#webhookEvents.set(eventId, at);
-        return true;
-    }
-
-    async releaseWebhookEvent(eventId: string) {
-        this.#webhookEvents.delete(eventId);
-    }
-
-    async purgeWebhookEvents(before: string) {
-        let count = 0;
-        for (const [id, at] of this.#webhookEvents) {
-            if (at < before) {
-                this.#webhookEvents.delete(id);
-                count++;
-            }
-        }
-        return count;
+    async list(table: TableName, query?: Query) {
+        return [...this.#table(table).values()]
+            .filter((stored) => matches(stored.row, stored.partitionKey, query))
+            .map((stored) => ({ ...stored, row: { ...stored.row } }));
     }
 }
-
-const copy = <T extends object>(value: T | undefined): T | undefined => (value ? { ...value } : undefined);

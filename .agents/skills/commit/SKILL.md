@@ -74,7 +74,7 @@ Include a body only when it adds non-obvious context. Skip it for trivial or sel
 - [ ] Subject describes the change, not the file.
 - [ ] Body (if present) is separated by a blank line and explains *why*.
 - [ ] Body lines wrap at ~72 characters.
-- [ ] `pnpm lint`, `pnpm typecheck` and `pnpm test` pass; `pnpm test:integration` if the relay, the Teams or MCP side, the store or the server changed.
+- [ ] `pnpm lint`, `pnpm typecheck` and `pnpm test` pass; `pnpm test:integration` if the relay, the Teams side, the tools, the store or the server changed.
 - [ ] No internal names, hosts or credentials in the message or the diff.
 - [ ] **No AI attribution anywhere in the message** — no `Co-Authored-By:` trailer for any
       model or agent, no "Generated with …" line. Absolutely prohibited, even when the
@@ -85,22 +85,22 @@ Include a body only when it adds non-obvious context. Skip it for trivial or sel
 Feature, with body explaining why:
 
 ```
-[feature] Expire approval cards after a configurable time
+[feature] Archive inactive conversations after a configurable time
 
-Cards left open for days were approved against a state that no longer
-existed; approval_expiry_hours lets a deployment close them.
+Idle sessions never end on their own, so Teams content stayed in Claude
+longer than in Switchboard; SESSION_ARCHIVE_AFTER_DAYS bounds it.
 ```
 
 Security fix, no body:
 
 ```
-[fix] Neutralise the approval marker in display names
+[fix] Neutralise header lines in display names
 ```
 
 Internal restructuring:
 
 ```
-[refactor] Move card rendering out of the approval service
+[refactor] Move card rendering out of the card service
 ```
 
 Dependency bump:

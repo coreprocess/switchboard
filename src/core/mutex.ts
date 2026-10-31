@@ -1,6 +1,6 @@
 /**
  * Serializes async work per key: tasks for the same key run one after another, tasks for different keys run
- * concurrently. Switchboard runs as a single replica, so an in-process lock is enough.
+ * concurrently. Within one pod only; across pods Switchboard coordinates through conditional writes in the store.
  */
 export class KeyedMutex {
     readonly #tails = new Map<string, Promise<void>>();

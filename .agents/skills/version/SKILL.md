@@ -17,10 +17,10 @@ Tags MUST match `^v[0-9]+\.[0-9]+\.[0-9]+$` — three numeric components, prefix
 
 Switchboard is consumed by deployments that pin an image version and by agents that call its tools and read its messages. Its public contract is:
 
-- **Configuration:** environment variable names, accepted values and defaults; the channels file schema (`README.md` → Configuration).
-- **Tools:** MCP tool names, input parameters, and the shape of their responses.
-- **Message formats agents rely on:** the `[teams]` header line and the `[switchboard:approval]` marker.
-- **Endpoints:** the HTTP paths and their behaviour, the Teams app manifest's permissions.
+- **Configuration:** environment variable names, accepted values and defaults (`README.md` → Configuration).
+- **Tools:** the custom tools Switchboard adds to sessions: names, input parameters, and the shape of their results.
+- **Message formats agents rely on:** the `[teams]` and `[switchboard:…]` header lines and the system prompt appendix.
+- **Endpoints:** the HTTP paths and their behaviour, the commands, the Teams app manifest's permissions.
 
 ## Deciding the bump level
 
@@ -28,8 +28,8 @@ Pick the **highest applicable** level from the table. If any commit since the la
 
 | Level | Bump from `vX.Y.Z` | Use when at least one commit since the last tag... |
 |-------|---------------------|----------------------------------------------------|
-| `major` | `v(X+1).0.0` | Breaks the public contract: a removed or renamed environment variable or channels file key, a changed default that alters behavior, a removed or renamed tool or parameter, an incompatible change to the header or marker format, a removed or changed endpoint. |
-| `minor` | `vX.(Y+1).0` | Adds something without breaking existing usage: a new tool or optional parameter, a new optional environment variable or channels file key, a new field in a response. |
+| `major` | `v(X+1).0.0` | Breaks the public contract: a removed or renamed environment variable, a changed default that alters behavior, a removed or renamed tool or parameter, an incompatible change to a header line format, a removed or changed endpoint. |
+| `minor` | `vX.(Y+1).0` | Adds something without breaking existing usage: a new tool or optional parameter, a new optional environment variable, a new field in a response. |
 | `patch` | `vX.Y.(Z+1)` | Backward-compatible polish only: bug fixes, validation fixes that close a gap without rejecting legitimate input, internal refactors, dependency bumps, build/CI changes, doc edits, repo hygiene. |
 
 ### Mapping by commit type (fallback heuristic)

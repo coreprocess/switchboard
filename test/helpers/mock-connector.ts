@@ -16,6 +16,13 @@ export class MockConnector {
     readonly messages: ConnectorMessage[] = [];
     /** `POST /v3/conversations` requests: new top-level channel posts. */
     readonly created: Json[] = [];
+    /** Teams the connector knows: details and channels (`v3/teams/…`). */
+    readonly teams = new Map<
+        string,
+        { name: string; aadGroupId: string; channels: { id: string; name: string | null }[] }
+    >();
+    /** Attachment content served at `/attachments/<id>`. */
+    readonly attachments = new Map<string, { type: string; data: Buffer }>();
     url = '';
     #server: Server | undefined;
     #next = 5000;
@@ -35,6 +42,21 @@ export class MockConnector {
     async start() {
         const app = express();
         app.use(express.json({ limit: '5mb' }));
+        app.get('/v3/teams/:teamId', (req, res) => {
+            const team = this.teams.get(req.params.teamId);
+            if (!team) return void res.status(404).end();
+            res.json({ id: req.params.teamId, name: team.name, aadGroupId: team.aadGroupId });
+        });
+        app.get('/v3/teams/:teamId/conversations', (req, res) => {
+            const team = this.teams.get(req.params.teamId);
+            if (!team) return void res.status(404).end();
+            res.json({ conversations: team.channels });
+        });
+        app.get('/attachments/:id', (req, res) => {
+            const attachment = this.attachments.get(req.params.id);
+            if (!attachment) return void res.status(404).end();
+            res.type(attachment.type).send(attachment.data);
+        });
         app.post('/v3/conversations', (req, res) => {
             const params = req.body as { channelData?: { channel?: { id?: string } }; activity?: Json };
             const id = String(this.#next++);
@@ -74,6 +96,7 @@ export class MockConnector {
     }
 
     async stop() {
+        this.#server?.closeAllConnections();
         await new Promise<void>((resolve) => this.#server?.close(() => resolve()));
     }
 }

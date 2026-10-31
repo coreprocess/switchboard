@@ -28,31 +28,48 @@ under `.agents/skills/`. `.claude` is a symlink to `.agents`.
 - Biome owns formatting and linting of code; run `pnpm format`, never hand-format against it. Markdown is not
   formatted by Biome.
 - Run `pnpm lint`, `pnpm typecheck` and `pnpm test` before committing; run `pnpm test:integration` (needs Docker)
-  when the relay, the Teams or MCP side, the store or the HTTP server changed.
+  when the relay, the Teams side, the tools, the store or the HTTP server changed.
 
 ## Trust boundaries
 
 Switchboard sits between people in Teams and agents; both sides are untrusted.
 
 - Validate everything that arrives from Teams (activities, `channelData`, card actions) and from agents (tool
-  arguments, cards) before using it. Parse with schemas; never assume a field is present.
-- Only Switchboard produces `[switchboard:…]` and `[teams]` tokens. Every human-written string that reaches an agent
-  (message text, display names) goes through `neutralise` / `sanitiseName` (`src/core/text.ts`). A change to these
-  rules comes with cases in `test/unit/text.test.ts`.
-- An approval is decided once (conditional write in the store), only by a click from the card's own channel and
-  message, by someone allowed there. Changes to that path come with cases in `test/unit/approvals.test.ts`.
-- Never log secrets (API keys, MCP tokens, webhook secrets) or message text above `debug`.
+  inputs, card JSON) before using it. Parse with schemas; never assume a field is present.
+- Only Switchboard produces `[switchboard:…]` and `[teams]` header lines. Every human-written string that reaches an
+  agent (message text, display names, card data) goes through `neutralise` / `quoted` (`src/core/text.ts`). A change
+  to these rules comes with cases in `test/unit/text.test.ts`.
+- A card click counts once (conditional write `open → locked`), only from the card's own team and channel, and the
+  clicker's identity comes from the verified activity, never from the card's data. Admin actions are checked against
+  `SWITCHBOARD_ADMINS` the same way. Changes to these paths come with cases in `test/unit/tools-cards.test.ts` and
+  `test/unit/admin-jobs.test.ts`.
+- Never log secrets (API keys, webhook secrets, tokens) or content (messages, cards, attachments) above `debug`;
+  log IDs, sizes and outcomes.
+
+## Several pods
+
+Switchboard runs on several pods from the start; Table Storage is the only shared state.
+
+- Coordinate only through conditional writes (insert-if-absent, update-with-ETag): one session per thread, one run
+  per tick and job, the first click per card, at most one execution per tool call. No in-memory state may be
+  needed by another pod, apart from short caches.
 - Relaying stays idempotent: what reaches Teams is derived from the session's event list after the stored
-  watermark, never from stream order alone.
+  watermark, never from stream order alone. Only the holder of a session's lease follows it, and it stops at once
+  when a renewal fails.
+- A change to coordination comes with a case in `test/unit/pods.test.ts`, and runs against Azurite with two
+  instances (`test/integration/pods-azurite.test.ts`).
 
 ## Generic by design
 
-- No domain logic: Switchboard moves messages, links threads to sessions, renders approval cards and relays
-  replies. What to post and how to react is the agents' job.
-- Everything deployment-specific is configuration (channels file, environment variables). New behaviour that only
-  one deployment needs becomes a configuration option or stays out.
-- Teams stays behind `ChannelGateway` (`src/core/gateway.ts`) and `src/teams/`; the relay, MCP tools and approvals
-  do not import Teams code, so another platform could be added.
+- No domain logic: Switchboard connects channels to deployments, keeps threads and sessions one to one, runs jobs,
+  passes messages and cards through and keeps the conversation log. What to post and how to react is the agents'
+  job; agent cards pass through unchanged apart from Switchboard's card ID.
+- Everything deployment-specific is configuration (environment variables) or data an admin manages in Teams
+  (bindings, jobs). New behaviour that only one deployment needs becomes a configuration option or stays out.
+- Teams stays behind `ChannelGateway` (`src/core/gateway.ts`), `HistoryReader` and `src/teams/`; sessions,
+  conversations, tools, cards, jobs and the relay do not import Teams code, so another platform could be added.
+- Switchboard's system prompt appendix (`prompt/switchboard-appendix.md`) stays short and generic; it may not
+  contain anything deployment-specific.
 
 ## Documentation
 

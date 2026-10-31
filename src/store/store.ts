@@ -1,114 +1,87 @@
 /**
- * Switchboard's persistent state. Implementations: Azure Table Storage (production) and memory (tests, local
- * development). Every record is small; no implementation needs transactions beyond the conditional writes below.
+ * Switchboard's only shared state: rows in tables, coordinated through conditional writes. An insert fails when
+ * the row exists; an update or delete with an ETag fails when the row changed in the meantime. Several pods use
+ * the same store; nothing else is shared between them.
  */
 
-/** A Teams thread linked to the agent session that receives its replies. */
-export interface ThreadLink {
-    channelKey: string;
-    /** ID of the thread's root message. */
-    rootId: string;
-    sessionId: string;
-    createdAt: string;
-    /** Entra object ID of the person who started the thread, or `agent` for threads an agent posted. */
-    createdBy: string;
+export const TABLES = [
+    'bindings',
+    'jobs',
+    'jobruns',
+    'conversations',
+    'sessions',
+    'files',
+    'cards',
+    'logs',
+    'toolcalls',
+    'teamsrefs',
+    'seen',
+] as const;
+
+export type TableName = (typeof TABLES)[number];
+
+export type Scalar = string | number | boolean;
+
+/** Row properties; an absent property is the empty value (Table Storage has no null). */
+export type Row = Record<string, Scalar>;
+
+export interface StoredRow {
+    partitionKey: string;
+    rowKey: string;
+    /** Changes with every write; conditional updates and deletes compare it. */
+    etag: string;
+    row: Row;
 }
 
-/** Relay state of a linked session. */
-export interface SessionRecord {
-    sessionId: string;
-    channelKey: string;
-    rootId: string;
-    /** The last session event the relay has handled; everything after it is still to be relayed. */
-    watermarkEventId: string | undefined;
-    /** When the watermark event was created (approximately), to narrow event listings. */
-    watermarkAt: string | undefined;
-    /** Switchboard sent something into the session and waits for the turn to end (stream state). */
-    pending: boolean;
-    /** The last event Switchboard sent; a turn only counts as answered at an idle after it. */
-    lastSentEventId: string | undefined;
-    /** The "working…" message shown in the thread while the turn runs. */
-    workingMessageId: string | undefined;
-    updatedAt: string;
+export interface Condition {
+    field: string;
+    op: 'eq' | 'ne' | 'lt' | 'le' | 'gt' | 'ge';
+    value: Scalar;
 }
 
-export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired';
-
-export interface ApprovalRecord {
-    cardId: string;
-    /** `approval`: request_approval card; `tool_confirmation`: a tool call waiting for `user.tool_confirmation`. */
-    kind: 'approval' | 'tool_confirmation';
-    sessionId: string;
-    channelKey: string;
-    rootId: string;
-    /** Teams message ID of the card, once posted. */
-    messageId: string | undefined;
-    title: string;
-    summary: string;
-    steps: string[];
-    /** For `tool_confirmation`: the `agent.tool_use` / `agent.mcp_tool_use` event to confirm. */
-    toolUseId: string | undefined;
-    status: ApprovalStatus;
-    decidedBy: string | undefined;
-    decidedByAad: string | undefined;
-    decidedAt: string | undefined;
-    createdAt: string;
-    expiresAt: string | undefined;
-}
-
-export interface ApprovalDecisionUpdate {
-    status: Exclude<ApprovalStatus, 'pending'>;
-    decidedBy: string | undefined;
-    decidedByAad: string | undefined;
-    decidedAt: string;
-}
-
-export interface DecisionResult {
-    /** `false` when the card was already decided: the first decision wins. */
-    applied: boolean;
-    record: ApprovalRecord;
-}
-
-/** What Switchboard needs to post into a channel proactively. */
-export interface ConversationRecord {
-    channelKey: string;
-    serviceUrl: string;
-    tenantId: string;
-    /** Teams channel ID (conversation ID of the channel without `;messageid=`). */
-    channelId: string;
-    teamId: string | undefined;
-    aadGroupId: string | undefined;
-    botId: string;
-    updatedAt: string;
+export interface Query {
+    partitionKey?: string;
+    /** All conditions must hold. */
+    where?: Condition[];
 }
 
 export interface Store {
-    /** Creates tables or schemas if they don't exist. */
+    /** Creates missing tables. */
     init(): Promise<void>;
-    /** Fails when the store is unreachable (readiness probe). */
+    /** Throws when the store cannot be reached (readiness). */
     ping(): Promise<void>;
-
-    getThread(channelKey: string, rootId: string): Promise<ThreadLink | undefined>;
-    putThread(link: ThreadLink): Promise<void>;
-
-    getSession(sessionId: string): Promise<SessionRecord | undefined>;
-    putSession(record: SessionRecord): Promise<void>;
-    listSessionsUpdatedSince(since: string): Promise<SessionRecord[]>;
-
-    /** Creates the card's record; `false` if a record with this card ID exists already. */
-    createApproval(record: ApprovalRecord): Promise<boolean>;
-    getApproval(cardId: string): Promise<ApprovalRecord | undefined>;
-    setApprovalMessageId(cardId: string, messageId: string): Promise<void>;
-    /** Applies the decision only while the card is still pending; `undefined` for an unknown card. */
-    decideApproval(cardId: string, update: ApprovalDecisionUpdate): Promise<DecisionResult | undefined>;
-
-    getConversation(channelKey: string): Promise<ConversationRecord | undefined>;
-    putConversation(record: ConversationRecord): Promise<void>;
-
-    /** Records a webhook event as being processed; `false` if it was recorded before (duplicate delivery). */
-    claimWebhookEvent(eventId: string, at: string): Promise<boolean>;
-    /** Forgets a claimed event whose processing failed, so a redelivery is processed. */
-    releaseWebhookEvent(eventId: string): Promise<void>;
-    /** Deletes webhook events recorded before `before`; returns how many. */
-    purgeWebhookEvents(before: string): Promise<number>;
+    get(table: TableName, partitionKey: string, rowKey: string): Promise<StoredRow | undefined>;
+    /** `undefined` when a row with these keys exists already. */
+    insert(table: TableName, partitionKey: string, rowKey: string, row: Row): Promise<StoredRow | undefined>;
+    /** Replaces the row if its ETag still matches; `undefined` when it changed or is gone. */
+    update(table: TableName, current: StoredRow, row: Row): Promise<StoredRow | undefined>;
+    /** Writes the row unconditionally. */
+    upsert(table: TableName, partitionKey: string, rowKey: string, row: Row): Promise<void>;
+    /** Deletes the row (only if its ETag matches, when given); `false` when it was gone or changed. */
+    delete(table: TableName, partitionKey: string, rowKey: string, etag?: string): Promise<boolean>;
+    list(table: TableName, query?: Query): Promise<StoredRow[]>;
 }
+
+/** Whether a row satisfies a query; the in-memory store uses it, the Table Storage store sends it as a filter. */
+export const matches = (row: Row, partitionKey: string, query: Query = {}): boolean => {
+    if (query.partitionKey !== undefined && query.partitionKey !== partitionKey) return false;
+    return (query.where ?? []).every(({ field, op, value }) => {
+        const actual = row[field];
+        // as in Table Storage: a condition on a missing property never matches
+        if (actual === undefined) return false;
+        switch (op) {
+            case 'eq':
+                return actual === value;
+            case 'ne':
+                return actual !== value;
+            case 'lt':
+                return actual < value;
+            case 'le':
+                return actual <= value;
+            case 'gt':
+                return actual > value;
+            case 'ge':
+                return actual >= value;
+        }
+    });
+};

@@ -1,248 +1,226 @@
-import { APIError } from '@anthropic-ai/sdk';
 import { Activity } from '@microsoft/agents-activity';
 import type { TurnContext } from '@microsoft/agents-hosting';
 import { z } from 'zod';
-import type { Approvals } from '../approvals/approvals.ts';
-import type { ClaudeApi } from '../claude/api.ts';
-import { budgetOf, type ChannelsConfig } from '../config/channels.ts';
-import { formatThreadId } from '../core/gateway.ts';
-import type { Logger } from '../core/logger.ts';
-import { clip, firstLine, formatHumanMessage } from '../core/text.ts';
-import type { Relay, Thread } from '../relay/relay.ts';
-import type { ConversationRecord, Store } from '../store/store.ts';
-import {
-    type Binding,
-    bindingOf,
-    hasFileAttachments,
-    isBotMentioned,
-    type TeamsOrigin,
-    textWithoutBotMention,
-    userAllowed,
-} from './access.ts';
+import type { IncomingAttachment } from '../attachments/attachments.ts';
+import { CARD_DATA_KEY, CONFIRMATION_DATA_KEY } from '../cards/cards.ts';
+import type { CardJson } from '../core/gateway.ts';
+import { clip } from '../core/text.ts';
+import { markSeen } from '../store/entities.ts';
+import type { Switchboard } from '../switchboard.ts';
+import { commandOf, isBotMentioned, messageText, type TeamsOrigin, teamsOriginOf } from './activity.ts';
+import { type Actor, ChannelAdmin, type ChannelContext, NOT_SET_UP } from './admin.ts';
+import type { TeamsGateway } from './gateway.ts';
+import { SETTINGS_DATA_KEY, SettingsInput, VERB_DISCONNECT, VERB_SAVE } from './settings-card.ts';
 
-export const NOT_CONFIGURED = 'Switchboard is not configured for this conversation.';
-export const NOT_ALLOWED = 'You are not allowed to talk to the agent in this channel.';
-export const ATTACHMENTS_NOTICE = 'Attachments are not supported yet; only the text was passed to the agent.';
-const EMPTY_MENTION = 'Mention me together with a message to start.';
+export const ONLY_IN_CHANNELS =
+    'Switchboard works in team channels. Mention it there, for example `@Switchboard status`.';
 
 const CardAction = z.object({
     action: z.object({
-        verb: z.string(),
-        data: z.looseObject({ card_id: z.string().regex(/^(card|tc)_[A-Za-z0-9_-]{1,200}$/) }),
+        verb: z.string().max(200),
+        data: z.record(z.string(), z.unknown()).default({}),
     }),
     /** `automatic` for invokes Teams sends by itself (card refresh); only clicks count. */
     trigger: z.string().optional(),
 });
 
-export interface TeamsBotOptions {
-    config: ChannelsConfig;
-    store: Store;
-    api: ClaudeApi;
-    relay: Relay;
-    approvals: Approvals;
-    log: Logger;
-}
+const ID = z.string().regex(/^[A-Za-z0-9_-]{1,200}$/);
 
-type BoundBinding = Extract<Binding, { bound: true }>;
-
-const errorText = (error: unknown) => clip(error instanceof Error ? error.message : String(error), 300);
-
-/** Handles activities from Teams: messages in bound channels, approval card clicks and app installs. */
+/** Handles activities from Teams: messages and commands in channels, and card clicks. */
 export class TeamsBot {
-    readonly #config: ChannelsConfig;
-    readonly #store: Store;
-    readonly #api: ClaudeApi;
-    readonly #relay: Relay;
-    readonly #approvals: Approvals;
-    readonly #log: Logger;
-    /** Last conversation reference written per channel, to skip redundant writes. */
-    readonly #remembered = new Map<string, string>();
+    readonly #sb: Switchboard;
+    readonly #teams: TeamsGateway;
+    readonly #admin: ChannelAdmin;
 
-    constructor(options: TeamsBotOptions) {
-        this.#config = options.config;
-        this.#store = options.store;
-        this.#api = options.api;
-        this.#relay = options.relay;
-        this.#approvals = options.approvals;
-        this.#log = options.log;
+    constructor(sb: Switchboard, teams: TeamsGateway) {
+        this.#sb = sb;
+        this.#teams = teams;
+        this.#admin = new ChannelAdmin(sb, teams);
     }
 
     async handle(context: TurnContext): Promise<void> {
+        const sb = this.#sb;
         const activity = context.activity;
         if (activity.from?.role === 'bot') return;
-        const binding = bindingOf(this.#config, activity);
-        await this.#rememberTeam(activity, binding.origin);
-        switch (activity.type) {
-            case 'message':
-                return this.#onMessage(context, binding);
-            case 'invoke':
-                return this.#onInvoke(context, binding);
-            default:
-                return;
+        const origin = teamsOriginOf(activity);
+        if (!origin.tenantId || !sb.settings.tenants.includes(origin.tenantId)) return;
+        await this.#rememberTeam(activity, origin);
+        if (activity.type !== 'message' && activity.type !== 'invoke') return;
+        // Teams may deliver an activity twice; every pod handles it at most once
+        if (
+            activity.id &&
+            !(await markSeen(sb.entities, 'activity', `${origin.conversationId}|${activity.type}|${activity.id}`))
+        ) {
+            return;
         }
+        if (activity.type === 'message') return this.#onMessage(context, origin);
+        return this.#onInvoke(context, origin);
     }
 
-    /**
-     * Stores a conversation reference for every bound channel of the activity's team (installs arrive from the
-     * General channel), so Switchboard can post into those channels proactively.
-     */
+    /** Stores the team's conversation reference, so Switchboard can post into its channels proactively. */
     async #rememberTeam(activity: Activity, origin: TeamsOrigin) {
-        if (!activity.serviceUrl || !activity.recipient?.id) return;
-        if (origin.tenantId?.toLowerCase() !== this.#config.tenant_id.toLowerCase()) return;
-        if (!origin.teamId && !origin.aadGroupId) return;
-        for (const [channelKey, channel] of Object.entries(this.#config.channels)) {
-            const sameTeam =
-                (channel.team_id !== undefined && channel.team_id === origin.teamId) ||
-                (channel.team_aad_group_id !== undefined &&
-                    channel.team_aad_group_id.toLowerCase() === origin.aadGroupId?.toLowerCase());
-            if (!sameTeam) continue;
-            const record: ConversationRecord = {
-                channelKey,
-                serviceUrl: activity.serviceUrl,
-                tenantId: this.#config.tenant_id,
-                channelId: channel.channel_id,
-                teamId: origin.teamId ?? channel.team_id,
-                aadGroupId: origin.aadGroupId ?? channel.team_aad_group_id,
-                botId: activity.recipient.id,
-                updatedAt: new Date().toISOString(),
-            };
-            const fingerprint = JSON.stringify({ ...record, updatedAt: undefined });
-            if (this.#remembered.get(channelKey) === fingerprint) continue;
-            await this.#store.putConversation(record);
-            this.#remembered.set(channelKey, fingerprint);
-        }
+        const sb = this.#sb;
+        if (!origin.teamId || !activity.serviceUrl || !activity.recipient?.id || !origin.tenantId) return;
+        const existing = (await sb.entities.teamsRefs.get(origin.teamId))?.value;
+        const next = {
+            teamId: origin.teamId,
+            tenantId: origin.tenantId,
+            serviceUrl: activity.serviceUrl,
+            botId: activity.recipient.id,
+            aadGroupId: origin.aadGroupId ?? existing?.aadGroupId,
+            teamName: origin.teamName ?? existing?.teamName,
+            updatedAt: sb.now().toISOString(),
+        };
+        const same =
+            existing &&
+            existing.serviceUrl === next.serviceUrl &&
+            existing.botId === next.botId &&
+            existing.aadGroupId === next.aadGroupId &&
+            existing.teamName === next.teamName;
+        if (!same) await sb.entities.teamsRefs.upsert(next);
     }
 
-    async #onMessage(context: TurnContext, binding: Binding) {
+    #channel(origin: TeamsOrigin): ChannelContext | undefined {
+        if (origin.conversationType !== 'channel' || !origin.teamId || !origin.channelId || !origin.tenantId)
+            return undefined;
+        return {
+            teamId: origin.teamId,
+            channelId: origin.channelId,
+            tenantId: origin.tenantId,
+            aadGroupId: origin.aadGroupId,
+            teamName: origin.teamName,
+        };
+    }
+
+    #actor(activity: Activity, origin: TeamsOrigin): Actor {
+        return { tenantId: origin.tenantId ?? '', aadObjectId: activity.from?.aadObjectId, name: activity.from?.name };
+    }
+
+    async #onMessage(context: TurnContext, origin: TeamsOrigin) {
+        const sb = this.#sb;
         const activity = context.activity;
         const mentioned = isBotMentioned(activity);
-        if (!binding.bound) {
-            // With resource-specific consent the bot sees every channel message; answer only when addressed.
-            if (binding.origin.conversationType !== 'personal' && !mentioned) return;
-            if (binding.reason === 'not_bound') {
-                // The IDs to put into the channels file to bind this channel.
-                const { teamId, aadGroupId, channelId } = binding.origin;
-                this.#log.info({ teamId, aadGroupId, channelId }, 'mention in an unbound channel');
-            }
-            await context.sendActivity(NOT_CONFIGURED);
+        const channel = this.#channel(origin);
+        if (!channel) {
+            if (mentioned) await context.sendActivity(ONLY_IN_CHANNELS);
+            return;
+        }
+        const command = commandOf(activity);
+        if (command) {
+            const answer = await this.#admin.command(command, channel, this.#actor(activity, origin));
+            await context.sendActivity(
+                'card' in answer
+                    ? Activity.fromObject({
+                          type: 'message',
+                          attachments: [
+                              { contentType: 'application/vnd.microsoft.card.adaptive', content: answer.card },
+                          ],
+                      })
+                    : Activity.fromObject({ type: 'message', text: answer.text, textFormat: 'markdown' })
+            );
+            return;
+        }
+        const binding = await this.#admin.binding(channel);
+        if (!binding) {
+            if (mentioned) await context.sendActivity(NOT_SET_UP);
             return;
         }
         const aadObjectId = activity.from?.aadObjectId;
-        if (!aadObjectId || !userAllowed(binding.channel, aadObjectId)) {
-            if (mentioned) await context.sendActivity(NOT_ALLOWED);
-            return;
+        if (!aadObjectId || !activity.id) return;
+        const rootId = origin.rootId ?? activity.id;
+        if (!binding.aadGroupId && origin.aadGroupId) {
+            await sb.entities.bindings.modify(binding.teamId, binding.channelId, (current) => ({
+                ...current,
+                aadGroupId: origin.aadGroupId,
+            }));
         }
-        const rootId = binding.origin.rootId ?? activity.id;
-        if (!rootId) return;
-        const thread: Thread = { channelKey: binding.channelKey, rootId };
-        const link = await this.#store.getThread(thread.channelKey, rootId);
-        if (!link && !mentioned) return;
-
-        const text = textWithoutBotMention(activity);
-        if (!text) {
-            if (mentioned) await context.sendActivity(EMPTY_MENTION);
-            return;
-        }
-        const message = formatHumanMessage({
-            channelKey: thread.channelKey,
-            threadId: formatThreadId(thread.channelKey, rootId),
-            name: activity.from?.name,
-            aadObjectId,
-            at: new Date(),
-            text,
+        await sb.conversations.onHuman({
+            binding: { ...binding, aadGroupId: binding.aadGroupId ?? origin.aadGroupId },
+            rootId,
+            messageId: activity.id,
+            isRoot: rootId === activity.id,
+            from: { name: activity.from?.name, aadObjectId },
+            at: activity.timestamp ? new Date(activity.timestamp) : sb.now(),
+            text: messageText(activity),
+            attachments: await this.#attachments(activity),
         });
+    }
 
-        if (!link) {
-            await this.#startSession(context, binding, thread, message, text, aadObjectId);
-        } else {
+    /** Images Teams attached (inline pictures); files and other types are passed on as "not supported". */
+    async #attachments(activity: Activity): Promise<IncomingAttachment[]> {
+        const sb = this.#sb;
+        const result: IncomingAttachment[] = [];
+        for (const attachment of activity.attachments ?? []) {
+            const type = attachment.contentType ?? '';
+            if (type.startsWith('text/html') || type === 'application/vnd.microsoft.card.adaptive') continue;
+            const name = attachment.name ?? 'attachment';
+            if (!type.startsWith('image/') || !attachment.contentUrl) {
+                result.push({
+                    name,
+                    mediaType: type === 'reference' ? 'file' : type || 'unknown',
+                    size: 0,
+                    problem: 'type not supported',
+                });
+                continue;
+            }
             try {
-                await this.#relay.sendUserMessage(link.sessionId, thread, message);
+                const { data, mediaType } = await this.#teams.download(attachment.contentUrl);
+                const actualType =
+                    mediaType && mediaType.startsWith('image/') ? mediaType : type === 'image/*' ? 'image/png' : type;
+                result.push({ name, mediaType: actualType.split(';')[0] ?? actualType, size: data.byteLength, data });
             } catch (error) {
-                if (mentioned && (await this.#sessionEnded(link.sessionId))) {
-                    await this.#startSession(context, binding, thread, message, text, aadObjectId);
-                } else {
-                    this.#log.warn({ err: error, sessionId: link.sessionId }, 'message not delivered');
-                    await context.sendActivity(`⚠️ Your message could not be passed to the agent: ${errorText(error)}`);
-                }
+                sb.log.warn({ err: error }, 'attachment not downloaded');
+                result.push({ name, mediaType: type, size: 0, problem: 'could not be fetched' });
             }
         }
-        if (hasFileAttachments(activity)) await context.sendActivity(ATTACHMENTS_NOTICE);
+        return result;
     }
 
-    async #sessionEnded(sessionId: string): Promise<boolean> {
-        try {
-            return (await this.#api.retrieveSession(sessionId)).status === 'terminated';
-        } catch (error) {
-            if (error instanceof APIError && error.status === 404) return true;
-            throw error;
-        }
-    }
-
-    async #startSession(
-        context: TurnContext,
-        binding: BoundBinding,
-        thread: Thread,
-        message: string,
-        text: string,
-        createdBy: string
-    ) {
-        const { channel, channelKey } = binding;
-        const threadId = formatThreadId(channelKey, thread.rootId);
-        const budget = budgetOf(channel);
-        let sessionId: string;
-        try {
-            const session = await this.#api.createSession({
-                agent: channel.agent.version
-                    ? { type: 'agent', id: channel.agent.id, version: channel.agent.version }
-                    : channel.agent.id,
-                environment_id: channel.environment_id,
-                ...(channel.vault_ids.length > 0 ? { vault_ids: channel.vault_ids } : {}),
-                ...(channel.resources.length > 0 ? { resources: channel.resources } : {}),
-                ...(budget ? { budget } : {}),
-                title: `${channel.session_title_prefix}: ${firstLine(text, 120)}`,
-                metadata: { switchboard_channel: channelKey, switchboard_thread: threadId },
-            });
-            sessionId = session.id;
-        } catch (error) {
-            this.#log.error({ err: error, channelKey }, 'session not created');
-            await context.sendActivity(`⚠️ Could not start an agent session: ${errorText(error)}`);
-            return;
-        }
-        this.#log.info({ sessionId, channelKey, threadId }, 'session started');
-        await this.#relay.link(thread, sessionId, createdBy);
-        await this.#relay.sendUserMessage(sessionId, thread, message);
-    }
-
-    async #onInvoke(context: TurnContext, binding: Binding) {
+    async #onInvoke(context: TurnContext, origin: TeamsOrigin) {
+        const sb = this.#sb;
         const activity = context.activity;
         if (activity.name !== 'adaptiveCard/action') return;
         const respond = (body: Record<string, unknown>) =>
             context.sendActivity(Activity.fromObject({ type: 'invokeResponse', value: { status: 200, body } }));
         const message = (text: string) =>
             respond({ statusCode: 200, type: 'application/vnd.microsoft.activity.message', value: text });
+        const card = (value: CardJson) =>
+            respond({ statusCode: 200, type: 'application/vnd.microsoft.card.adaptive', value });
+        const answer = (result: CardJson | { message: string }) =>
+            'message' in result && typeof result.message === 'string' && Object.keys(result).length === 1
+                ? message(result.message)
+                : card(result as CardJson);
 
         const parsed = CardAction.safeParse(activity.value);
         if (!parsed.success) return void (await message('Unknown action.'));
-        if (!binding.bound) {
-            const { teamId, aadGroupId, channelId, conversationType } = binding.origin;
-            this.#log.info(
-                { reason: binding.reason, conversationType, teamId, aadGroupId, channelId },
-                'card click from an unbound conversation'
-            );
-            return void (await message(NOT_CONFIGURED));
+        if (parsed.data.trigger === 'automatic') return void (await message('Only a click counts.'));
+        const channel = this.#channel(origin);
+        if (!channel) return void (await message(ONLY_IN_CHANNELS));
+        const { verb, data } = parsed.data.action;
+        const actor = this.#actor(activity, origin);
+        const by = { name: activity.from?.name, aadObjectId: activity.from?.aadObjectId ?? '' };
+        if (!by.aadObjectId) return void (await message('Your identity could not be verified.'));
+
+        if (data[SETTINGS_DATA_KEY] !== undefined) {
+            if (data[SETTINGS_DATA_KEY] !== channel.channelId)
+                return void (await message('This card belongs to another channel.'));
+            if (verb === VERB_SAVE)
+                return void (await answer(await this.#admin.save(channel, actor, SettingsInput.parse(data))));
+            if (verb === VERB_DISCONNECT) {
+                if (!this.#admin.isAdmin(actor))
+                    return void (await message('Only Switchboard admins can change this.'));
+                const binding = await this.#admin.binding(channel);
+                if (binding) await this.#admin.disconnect(binding, actor);
+                return void (await card(await this.#admin.settingsCard(channel, '🔌 Disconnected.')));
+            }
+            return void (await message('Unknown action.'));
         }
-        if (parsed.data.trigger === 'automatic') return void (await message('Only a click decides.'));
-        const result = await this.#approvals.click({
-            cardId: parsed.data.action.data.card_id,
-            verb: parsed.data.action.verb,
-            channelKey: binding.channelKey,
-            channel: binding.channel,
-            rootId: binding.origin.rootId,
-            messageId: activity.replyToId,
-            aadObjectId: activity.from?.aadObjectId,
-            name: activity.from?.name,
-        });
-        if ('message' in result) return void (await message(result.message));
-        await respond({ statusCode: 200, type: 'application/vnd.microsoft.card.adaptive', value: result.card });
+        const click = { verb, data, by, channel, rootId: origin.rootId };
+        const confirmation = ID.safeParse(data[CONFIRMATION_DATA_KEY]);
+        if (confirmation.success)
+            return void (await answer(await sb.cards.confirm({ ...click, cardId: confirmation.data })));
+        const cardId = ID.safeParse(data[CARD_DATA_KEY]);
+        if (cardId.success) return void (await answer(await sb.cards.click({ ...click, cardId: cardId.data })));
+        await message(`Unknown card (${clip(verb, 60)}).`);
     }
 }

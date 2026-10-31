@@ -1,21 +1,17 @@
+# Configuration that must not be changeable from Teams. Bindings and jobs live in Table Storage and are managed
+# with `@Switchboard settings` in the channel.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: switchboard-channels
+  name: switchboard
   namespace: switchboard
 data:
-  channels.yaml: |
-    tenant_id: 00000000-0000-0000-0000-000000000000
-    alerts_channel: ops
-    channels:
-      ops:
-        description: Operations agent for the example product
-        team_id: "19:xxxxxxxx@thread.tacv2"
-        channel_id: "19:yyyyyyyy@thread.tacv2"
-        agent: { id: agent_xxx }
-        environment_id: env_xxx
-        vault_ids: [vlt_xxx]
-        resources:
-          - { type: memory_store, memory_store_id: memstore_xxx, access: read_write }
-        budget_usd: 10
-        session_title_prefix: Teams
+  SWITCHBOARD_TENANTS: '["00000000-0000-0000-0000-000000000000"]'
+  SWITCHBOARD_ADMINS: '[{"tenant": "00000000-0000-0000-0000-000000000000", "object_id": "00000000-0000-0000-0000-000000000001", "label": "Ops lead"}]'
+  # Claude sign-in per workspace through workload identity federation (projected token, see deployment.yaml)
+  SWITCHBOARD_WORKSPACES: '[{"id": "wrkspc_xxx", "name": "Example", "federation": {"rule_id": "fdrl_xxx", "organization_id": "00000000-0000-0000-0000-000000000002", "service_account_id": "svac_xxx"}}]'
+  SWITCHBOARD_PUBLIC_URL: https://switchboard.example.com
+  SWITCHBOARD_TABLE_PREFIX: switchboard
+  STORE_TABLES_ENDPOINT: https://<storage account>.table.core.windows.net
+  DEFAULT_TIMEZONE: Europe/Berlin
+  LOG_LEVEL: info

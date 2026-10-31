@@ -1,402 +1,439 @@
-import { setTimeout as sleep } from 'node:timers/promises';
-import { postApprovalCard } from '../approvals/post.ts';
-import { type ClaudeApi, messageText, type OutgoingEvent, type SessionEvent, type StreamEvent } from '../claude/api.ts';
-import type { ChannelGateway } from '../core/gateway.ts';
-import type { Logger } from '../core/logger.ts';
+import { APIError } from '@anthropic-ai/sdk';
+import type { SessionEvent } from '../claude/api.ts';
+import { messageText } from '../claude/api.ts';
 import { KeyedMutex } from '../core/mutex.ts';
-import { clip, splitMessage } from '../core/text.ts';
-import type { SessionRecord, Store } from '../store/store.ts';
+import { sleep } from '../core/time.ts';
+import type { SessionEntry } from '../store/entities.ts';
+import type { Switchboard } from '../switchboard.ts';
 
-export const WORKING_TEXT = '⏳ Working…';
-export const TERMINATED_NOTICE = 'This agent session has ended. Mention me in a new post to start a new one.';
-
-/** Stream events after which the event list has something to relay. */
-const DRAIN_TRIGGERS = new Set<StreamEvent['type']>([
-    'session.status_idle',
-    'session.status_terminated',
-    'session.error',
-]);
-
-/** Listings start this long before the watermark's time, so clock skew cannot hide the watermark event. */
-const WATERMARK_SLACK_MS = 5 * 60_000;
-
-export interface Thread {
-    channelKey: string;
-    rootId: string;
-}
-
-export interface RelayOptions {
-    api: ClaudeApi;
-    store: Store;
-    gateway: ChannelGateway;
-    log: Logger;
-    approvalExpiryHours: number | undefined;
-    reconnectDelayMs?: number;
-    /** A drain triggered by an event retries the listing until the event shows up. */
-    listAttempts?: number;
-    listRetryDelayMs?: number;
-}
+/** Events listed again before the watermark's time, as a margin for clock differences. */
+const WATERMARK_SLACK_MS = 5 * 60 * 1000;
+const STREAM_RETRY_MS = 5_000;
 
 type IdleEvent = Extract<SessionEvent, { type: 'session.status_idle' }>;
-type ErrorEvent = Extract<SessionEvent, { type: 'session.error' }>;
 type ToolUseEvent = Extract<SessionEvent, { type: 'agent.tool_use' | 'agent.mcp_tool_use' }>;
 
-const idleNotice = (stopReason: IdleEvent['stop_reason']): string | undefined => {
-    switch (stopReason.type) {
-        case 'budget_reached':
-            return '⚠️ The session reached its budget and paused. Raise or remove the budget in the Claude Console to continue.';
-        case 'retries_exhausted':
-            return '⚠️ The agent stopped after repeated errors.';
-        case 'refusal':
-            return '⚠️ The agent declined to continue.';
-        default:
-            return undefined;
-    }
+/** Turn-ending stop reasons other than `end_turn` and `requires_action`, as notices for the thread. */
+const STOP_NOTICES: Record<string, string> = {
+    retries_exhausted: '⚠️ The agent’s turn failed after several retries. Send a message to try again.',
+    refusal: '⚠️ The agent declined to continue this turn.',
 };
 
-const errorNotice = (event: ErrorEvent) => `⚠️ Agent error (${event.error.type}): ${clip(event.error.message, 500)}`;
+/** An event that fails this often in a row is skipped. */
+const MAX_EVENT_FAILURES = 3;
 
-const isToolUse = (event: SessionEvent): event is ToolUseEvent =>
-    event.type === 'agent.tool_use' || event.type === 'agent.mcp_tool_use';
+/** `stopping` reasons that mean "archive once idle". */
+const STOP_TO_ARCHIVE = ['disconnected', 'retention', 'inactive', 'claim_lost'];
+
+type Outcome = 'next' | 'pending' | 'ended';
+
+interface TurnState {
+    byId: Map<string, SessionEvent>;
+    finalText: string;
+    waitingForPeople: boolean;
+    settled: boolean;
+}
+
+interface Follower {
+    abort: AbortController;
+    renew: ReturnType<typeof setInterval>;
+    poll: ReturnType<typeof setInterval>;
+}
 
 /**
- * Moves agent output into Teams threads.
+ * Follows sessions that are working (concept: "Several pods on Table Storage"). One pod follows a session at a
+ * time, holding the session lease in the store (renewed every 20 s, valid for 60 s). The holder drains the
+ * session's events from the stored watermark: it answers custom tool calls, posts final answers and handles
+ * pauses and ends. A session waiting only for a person holds no lease.
  *
- * Switchboard opens a session's live stream whenever it sends something into the session and uses the stream only
- * as a wake-up signal. What gets relayed always comes from the session's event list after the session's watermark,
- * so the stream, webhooks and the reconciler run the same idempotent pass (`drain`), and a dropped stream or a
- * restart loses nothing.
- *
- * Only turns Switchboard started (`pending`) have their `agent.message` text relayed; output of turns it did not
- * start, such as the rest of a scheduled run after `post_message`, is skipped. Tool confirmations, errors and the
- * session's end are posted either way.
+ * Draining is idempotent: the watermark only advances at stable points (turn end, pause, end), so a pod that
+ * takes over repeats the open turn's events, and tool calls are carried out at most once (`Tools`).
  */
 export class Relay {
-    readonly #api: ClaudeApi;
-    readonly #store: Store;
-    readonly #gateway: ChannelGateway;
-    readonly #log: Logger;
-    readonly #expiryHours: number | undefined;
-    readonly #reconnectDelayMs: number;
-    readonly #listAttempts: number;
-    readonly #listRetryDelayMs: number;
+    readonly #sb: Switchboard;
+    readonly #followers = new Map<string, Follower>();
     readonly #mutex = new KeyedMutex();
-    readonly #streams = new Map<string, AbortController>();
+    readonly #rerun = new Set<string>();
+    /** Failed attempts per event ID, so a permanently failing event is skipped. */
+    readonly #failures = new Map<string, number>();
     #closed = false;
 
-    constructor(options: RelayOptions) {
-        this.#api = options.api;
-        this.#store = options.store;
-        this.#gateway = options.gateway;
-        this.#log = options.log;
-        this.#expiryHours = options.approvalExpiryHours;
-        this.#reconnectDelayMs = options.reconnectDelayMs ?? 2000;
-        this.#listAttempts = options.listAttempts ?? 4;
-        this.#listRetryDelayMs = options.listRetryDelayMs ?? 500;
+    constructor(sb: Switchboard) {
+        this.#sb = sb;
     }
 
-    /**
-     * Links a thread to a session. A session can be linked to several threads; its relay state follows the thread
-     * a turn started in. `watermark` is the event after which relaying starts (for threads an agent posted).
-     */
-    async link(
-        thread: Thread,
-        sessionId: string,
-        createdBy: string,
-        watermark?: { eventId: string | undefined; at: string | undefined }
-    ): Promise<void> {
-        await this.#mutex.run(sessionId, async () => {
-            const now = new Date().toISOString();
-            await this.#store.putThread({ ...thread, sessionId, createdAt: now, createdBy });
-            const existing = await this.#store.getSession(sessionId);
-            if (existing?.pending) return;
-            await this.#save({
-                sessionId,
-                channelKey: thread.channelKey,
-                rootId: thread.rootId,
-                watermarkEventId: watermark?.eventId ?? existing?.watermarkEventId,
-                watermarkAt: watermark?.at ?? existing?.watermarkAt,
-                pending: false,
-                lastSentEventId: existing?.lastSentEventId,
-                workingMessageId: undefined,
-                updatedAt: now,
-            });
+    isFollowing(sessionId: string) {
+        return this.#followers.has(sessionId);
+    }
+
+    /** Takes the lease if it is free or expired; `true` when this pod holds it now. */
+    async acquire(sessionId: string): Promise<boolean> {
+        const sb = this.#sb;
+        const stored = await sb.entities.sessions.get(sessionId);
+        if (!stored || stored.value.state !== 'active') return false;
+        const now = sb.now();
+        const { relayOwner, relayValidUntil } = stored.value;
+        const free = !relayOwner || !relayValidUntil || relayValidUntil <= now.toISOString();
+        if (relayOwner !== sb.podId && !free) return false;
+        const written = await sb.entities.sessions.update(stored, {
+            ...stored.value,
+            relayOwner: sb.podId,
+            relayValidUntil: new Date(now.getTime() + sb.timing.leaseMs).toISOString(),
         });
+        return written !== undefined;
     }
 
-    sendUserMessage(sessionId: string, thread: Thread, text: string): Promise<void> {
-        return this.#send(sessionId, thread, [{ type: 'user.message', content: [{ type: 'text', text }] }]);
-    }
-
-    sendToolConfirmation(sessionId: string, thread: Thread, toolUseId: string, allow: boolean, by: string) {
-        return this.#send(sessionId, thread, [
-            {
-                type: 'user.tool_confirmation',
-                tool_use_id: toolUseId,
-                result: allow ? 'allow' : 'deny',
-                ...(allow ? {} : { deny_message: `Denied by ${by} in Teams.` }),
-            },
-        ]);
-    }
-
-    /**
-     * Sends events into a session: opens the stream first, shows the "working…" message, marks the turn as
-     * pending and moves the watermark to the sent events when this starts a new turn.
-     */
-    async #send(sessionId: string, thread: Thread, events: OutgoingEvent[]): Promise<void> {
-        await this.#mutex.run(sessionId, async () => {
-            const record = await this.#store.getSession(sessionId);
-            if (!record) throw new Error(`session ${sessionId} is not linked to a thread`);
-            const startsTurn = !record.pending;
-            if (startsTurn) {
-                record.channelKey = thread.channelKey;
-                record.rootId = thread.rootId;
-            }
-            if (!record.workingMessageId) {
-                const { messageId } = await this.#gateway.reply(record.channelKey, record.rootId, {
-                    text: WORKING_TEXT,
-                });
-                record.workingMessageId = messageId;
-            }
-            record.pending = true;
-            await this.#save(record);
-            // Stream first, inside the lock: a drain running concurrently would otherwise close it again.
-            await this.ensureStream(sessionId);
-            let ids: string[];
-            try {
-                ids = await this.#api.sendEvents(sessionId, events);
-            } catch (error) {
-                if (startsTurn) {
-                    record.pending = false;
-                    await this.#removeWorking(record);
-                    await this.#save(record);
-                    this.closeStream(sessionId);
-                }
-                throw error;
-            }
-            const last = ids.at(-1);
-            if (last) {
-                record.lastSentEventId = last;
-                if (startsTurn) {
-                    record.watermarkEventId = last;
-                    record.watermarkAt = new Date().toISOString();
-                }
-                await this.#save(record);
-            }
-        });
-    }
-
-    /** Opens the session's live stream unless it is open; failures are logged, the reconciler catches up. */
-    async ensureStream(sessionId: string): Promise<void> {
-        if (this.#closed || this.#streams.has(sessionId)) return;
-        const controller = new AbortController();
-        this.#streams.set(sessionId, controller);
-        let stream: AsyncIterable<StreamEvent>;
-        try {
-            stream = await this.#api.streamEvents(sessionId, controller.signal);
-        } catch (error) {
-            this.#streams.delete(sessionId);
-            this.#log.warn({ err: error, sessionId }, 'could not open session stream');
+    /** Starts following a session whose lease this pod holds. */
+    follow(sessionId: string) {
+        if (this.#closed || this.#followers.has(sessionId)) {
+            this.#schedule(sessionId);
             return;
         }
-        void this.#consume(sessionId, controller, stream);
+        const sb = this.#sb;
+        const abort = new AbortController();
+        const follower: Follower = {
+            abort,
+            renew: setInterval(() => void this.#renew(sessionId), sb.timing.renewMs),
+            poll: setInterval(() => this.#schedule(sessionId), sb.timing.drainIntervalMs),
+        };
+        follower.renew.unref();
+        follower.poll.unref();
+        this.#followers.set(sessionId, follower);
+        this.#schedule(sessionId);
+        void this.#stream(sessionId, abort.signal);
     }
 
-    isStreaming(sessionId: string): boolean {
-        return this.#streams.has(sessionId);
+    /** Something happened to the session (a message was sent, a webhook, the reconciler): follow it if possible. */
+    async wake(sessionId: string) {
+        if (this.#closed) return;
+        if (this.#followers.has(sessionId)) {
+            this.#schedule(sessionId);
+            return;
+        }
+        if (await this.acquire(sessionId)) this.follow(sessionId);
     }
 
-    closeStream(sessionId: string): void {
-        this.#streams.get(sessionId)?.abort();
-        this.#streams.delete(sessionId);
-    }
-
-    /** Closes all streams; used on shutdown. */
-    close(): void {
+    /** Stops following everything and releases the leases, so other pods take over at once. */
+    async close() {
         this.#closed = true;
-        for (const controller of this.#streams.values()) controller.abort();
-        this.#streams.clear();
+        const sessions = [...this.#followers.keys()];
+        for (const sessionId of sessions) this.#stop(sessionId);
+        await Promise.all(sessions.map((sessionId) => this.#release(sessionId).catch(() => undefined)));
     }
 
-    async #consume(sessionId: string, controller: AbortController, stream: AsyncIterable<StreamEvent>) {
+    #stop(sessionId: string) {
+        const follower = this.#followers.get(sessionId);
+        if (!follower) return;
+        follower.abort.abort();
+        clearInterval(follower.renew);
+        clearInterval(follower.poll);
+        this.#followers.delete(sessionId);
+    }
+
+    /**
+     * Extends the lease. Other writes to the session entry (messages, the drain) make an ETag update fail now and
+     * then, so it retries; it gives up only when the lease belongs to someone else or the session ended.
+     */
+    async #renew(sessionId: string) {
+        const sb = this.#sb;
         try {
-            for await (const event of stream) {
-                if (!DRAIN_TRIGGERS.has(event.type) || !('id' in event)) continue;
-                this.drain(sessionId, event.id).catch((error: unknown) =>
-                    this.#log.error({ err: error, sessionId }, 'relay failed')
-                );
+            for (let attempt = 0; attempt < 8; attempt++) {
+                const stored = await sb.entities.sessions.get(sessionId);
+                const ours = stored?.value.relayOwner === sb.podId && stored.value.state === 'active';
+                if (!stored || !ours) break;
+                const renewed = await sb.entities.sessions.update(stored, {
+                    ...stored.value,
+                    relayValidUntil: new Date(sb.now().getTime() + sb.timing.leaseMs).toISOString(),
+                });
+                if (renewed) return;
             }
+            // lost the lease (or the session ended): stop at once, another pod may follow it now
+            this.#stop(sessionId);
+            sb.log.info({ sessionId }, 'session lease lost');
         } catch (error) {
-            if (!controller.signal.aborted) this.#log.warn({ err: error, sessionId }, 'session stream failed');
-        } finally {
-            if (this.#streams.get(sessionId) === controller) this.#streams.delete(sessionId);
+            sb.log.warn({ err: error, sessionId }, 'session lease not renewed');
         }
-        if (controller.signal.aborted || this.#closed) return;
-        // The stream ended on its own: catch up, then reconnect while the turn still runs.
-        try {
-            await sleep(this.#reconnectDelayMs);
-            await this.drain(sessionId);
-            if ((await this.#store.getSession(sessionId))?.pending) await this.ensureStream(sessionId);
-        } catch (error) {
-            this.#log.error({ err: error, sessionId }, 'stream reconnect failed');
+    }
+
+    async #release(sessionId: string) {
+        const sb = this.#sb;
+        await sb.entities.sessions.modify(sessionId, '', (current) =>
+            current.relayOwner === sb.podId
+                ? { ...current, relayOwner: undefined, relayValidUntil: undefined }
+                : undefined
+        );
+    }
+
+    /** Runs a drain for the session; one at a time, with one more run if something arrived meanwhile. */
+    #schedule(sessionId: string) {
+        if (this.#rerun.has(sessionId)) return;
+        this.#rerun.add(sessionId);
+        void this.#mutex
+            .run(sessionId, async () => {
+                this.#rerun.delete(sessionId);
+                if (!this.#followers.has(sessionId)) return;
+                await this.#drain(sessionId);
+            })
+            .catch((error: unknown) => {
+                this.#sb.log.warn({ err: error, sessionId }, 'session events not relayed');
+            });
+    }
+
+    /** The live stream only signals that something happened; draining reads the events themselves. */
+    async #stream(sessionId: string, signal: AbortSignal) {
+        const sb = this.#sb;
+        while (!signal.aborted) {
+            try {
+                const entry = await sb.sessions.get(sessionId);
+                if (!entry) return;
+                const stream = await sb.workspaces.get(entry.workspaceId).streamEvents(sessionId, signal);
+                this.#schedule(sessionId);
+                for await (const _event of stream) this.#schedule(sessionId);
+            } catch (error) {
+                if (signal.aborted) return;
+                sb.log.debug({ err: error, sessionId }, 'session stream interrupted');
+            }
+            if (!signal.aborted) await sleep(STREAM_RETRY_MS);
+        }
+    }
+
+    async #eventsAfterWatermark(entry: SessionEntry): Promise<SessionEvent[]> {
+        const api = this.#sb.workspaces.get(entry.workspaceId);
+        const mark = entry.watermarkEventId;
+        if (!mark) return api.listEvents(entry.sessionId);
+        const since = entry.watermarkAt
+            ? new Date(Date.parse(entry.watermarkAt) - WATERMARK_SLACK_MS).toISOString()
+            : undefined;
+        let events = await api.listEvents(entry.sessionId, since ? { processedAtGte: since } : {});
+        let index = events.findIndex((event) => event.id === mark);
+        if (index < 0) {
+            events = await api.listEvents(entry.sessionId);
+            index = events.findIndex((event) => event.id === mark);
+        }
+        if (index < 0) {
+            this.#sb.log.warn({ sessionId: entry.sessionId }, 'watermark not found; continuing after the latest event');
+            const last = events.at(-1);
+            if (last) await this.#advance(entry.sessionId, last);
+            return [];
+        }
+        return events.slice(index + 1);
+    }
+
+    async #advance(sessionId: string, event: SessionEvent) {
+        const sb = this.#sb;
+        await sb.sessions.modify(sessionId, (current) =>
+            current.relayOwner === sb.podId
+                ? { ...current, watermarkEventId: event.id, watermarkAt: event.processed_at ?? current.watermarkAt }
+                : undefined
+        );
+    }
+
+    async #drain(sessionId: string) {
+        const sb = this.#sb;
+        const entry = await sb.sessions.get(sessionId);
+        if (!entry || entry.relayOwner !== sb.podId) {
+            this.#stop(sessionId);
+            return;
+        }
+        if (entry.state !== 'active') {
+            this.#stop(sessionId);
+            await this.#release(sessionId);
+            return;
+        }
+        const events = await this.#eventsAfterWatermark(entry);
+        const turn: TurnState = {
+            byId: new Map(events.map((e) => [e.id, e])),
+            finalText: '',
+            waitingForPeople: false,
+            settled: false,
+        };
+        for (const event of events) {
+            let outcome: Outcome;
+            try {
+                outcome = await this.#process(sessionId, event, turn);
+                this.#failures.delete(event.id);
+            } catch (error) {
+                // a failure is retried with the next drain; one that keeps failing is skipped, so it cannot block
+                // the session for good (for example a thread deleted in Teams)
+                const failures = (this.#failures.get(event.id) ?? 0) + 1;
+                this.#failures.set(event.id, failures);
+                if (failures < MAX_EVENT_FAILURES) throw error;
+                this.#failures.delete(event.id);
+                sb.log.warn({ err: error, sessionId, eventId: event.id, type: event.type }, 'session event skipped');
+                if (event.type === 'session.status_idle') await this.#advance(sessionId, event);
+                continue;
+            }
+            if (outcome === 'ended') {
+                this.#stop(sessionId);
+                return;
+            }
+            // a tool call that cannot be answered yet: keep the watermark before it and look again later
+            if (outcome === 'pending') return;
+        }
+        if (turn.settled) {
+            await this.#maybeRelease(sessionId, turn.waitingForPeople);
+            return;
+        }
+        if (events.length === 0) await this.#checkQuiet(entry);
+    }
+
+    async #process(sessionId: string, event: SessionEvent, turn: TurnState): Promise<Outcome> {
+        const sb = this.#sb;
+        switch (event.type) {
+            case 'agent.message': {
+                const text = messageText(event);
+                if (text) turn.finalText = text;
+                return 'next';
+            }
+            case 'agent.custom_tool_use':
+                // text before a tool call is not the turn's final answer
+                turn.finalText = '';
+                await sb.tools.handle(sessionId, event);
+                return 'next';
+            case 'agent.tool_use':
+            case 'agent.mcp_tool_use':
+                turn.finalText = '';
+                return 'next';
+            case 'session.status_running':
+                turn.settled = false;
+                return 'next';
+            case 'session.status_idle': {
+                const entry = await sb.sessions.get(sessionId);
+                if (!entry) return 'ended';
+                const result = await this.#idle(entry, event, turn);
+                if (result === 'pending') return 'pending';
+                turn.finalText = '';
+                turn.settled = true;
+                turn.waitingForPeople = result === 'people';
+                await this.#advance(sessionId, event);
+                if (entry.stopping && STOP_TO_ARCHIVE.includes(entry.stopping) && result !== 'agent') {
+                    // disconnected (or expired) while it was running: archive it now that it is idle
+                    await sb.sessions.archive(entry, entry.stopping);
+                    return 'ended';
+                }
+                return 'next';
+            }
+            case 'session.status_terminated':
+            case 'session.deleted':
+                await this.#advance(sessionId, event);
+                await sb.sessions.end(sessionId, event.type === 'session.deleted' ? 'deleted' : 'terminated');
+                return 'ended';
+            case 'session.error':
+                sb.log.info(
+                    { sessionId, error: event.error.type, retry: event.error.retry_status.type },
+                    'session error'
+                );
+                return 'next';
+            default:
+                return 'next';
         }
     }
 
     /**
-     * Relays everything after the session's watermark that is complete: a turn's text once the session goes idle,
-     * tool confirmation cards, notices for errors, budget pauses and the session's end. Safe to call any time.
+     * A turn ended or paused: `people` when the session now waits for people (or nothing), `agent` when it goes
+     * on by itself (tool results answered), `pending` when a tool call cannot be answered yet.
      */
-    drain(sessionId: string, expectEventId?: string): Promise<void> {
-        return this.#mutex.run(sessionId, () => this.#drain(sessionId, expectEventId));
-    }
-
-    async #drain(sessionId: string, expectEventId: string | undefined) {
-        const record = await this.#store.getSession(sessionId);
-        if (!record) return;
-        let events = await this.#eventsAfterWatermark(record);
-        if (events === undefined) return;
-        for (
-            let attempt = 1;
-            expectEventId &&
-            expectEventId !== record.watermarkEventId &&
-            !events.some((e) => e.id === expectEventId) &&
-            attempt < this.#listAttempts;
-            attempt++
-        ) {
-            await sleep(this.#listRetryDelayMs);
-            events = (await this.#eventsAfterWatermark(record)) ?? [];
-        }
-
-        const text: string[] = [];
-        // The turn Switchboard waits for ends at an idle after the last event it sent; an idle before that ends
-        // an earlier turn while the latest message is still queued.
-        let sentSeen = !record.lastSentEventId || !events.some((e) => e.id === record.lastSentEventId);
-        for (const event of events) {
-            if (event.id === record.lastSentEventId) sentSeen = true;
-            switch (event.type) {
-                case 'agent.message': {
-                    const message = messageText(event);
-                    if (record.pending && message) text.push(message);
-                    break;
+    async #idle(entry: SessionEntry, event: IdleEvent, turn: TurnState): Promise<'people' | 'agent' | 'pending'> {
+        const sb = this.#sb;
+        const stop = event.stop_reason;
+        switch (stop.type) {
+            case 'end_turn':
+                if (entry.rootId) await sb.sessions.post(entry, turn.finalText, false);
+                if (entry.jobId && entry.runKey) await sb.jobs.turnEnded(entry, turn.finalText);
+                return 'people';
+            case 'requires_action':
+                return this.#requiresAction(entry, stop.event_ids, turn.byId);
+            case 'budget_reached':
+                if (entry.rootId && turn.finalText) await sb.sessions.post(entry, turn.finalText, false);
+                await sb.sessions.end(entry.sessionId, 'budget_reached');
+                return 'people';
+            default: {
+                if (entry.rootId) {
+                    await sb.sessions.post(entry, turn.finalText, false);
+                    await sb.sessions.notice(
+                        entry,
+                        STOP_NOTICES[stop.type] ?? `⚠️ The agent’s turn ended (${stop.type}).`
+                    );
                 }
-                case 'session.status_idle':
-                    await this.#flush(record, text, idleNotice(event.stop_reason));
-                    if (event.stop_reason.type === 'requires_action') {
-                        await this.#requestConfirmations(record, event.stop_reason.event_ids, events);
-                    }
-                    if (sentSeen || event.stop_reason.type !== 'end_turn') record.pending = false;
-                    await this.#advance(record, event);
-                    break;
-                case 'session.error':
-                    if (event.error.retry_status.type === 'retrying') break;
-                    await this.#flush(record, text, errorNotice(event));
-                    await this.#advance(record, event);
-                    break;
-                case 'session.status_terminated':
-                    await this.#flush(record, text, TERMINATED_NOTICE);
-                    record.pending = false;
-                    await this.#advance(record, event);
-                    break;
-                default:
-                    break;
+                if (entry.jobId && entry.runKey) await sb.jobs.turnFailed(entry, stop.type);
+                return 'people';
             }
         }
-        if (!record.pending) this.closeStream(sessionId);
     }
 
-    /** Events after the watermark; `undefined` when the watermark was lost and has been reset (nothing relayed). */
-    async #eventsAfterWatermark(record: SessionRecord): Promise<SessionEvent[] | undefined> {
-        const mark = record.watermarkEventId;
-        if (!mark) return this.#api.listEvents(record.sessionId);
-        const since = record.watermarkAt
-            ? new Date(Date.parse(record.watermarkAt) - WATERMARK_SLACK_MS).toISOString()
-            : undefined;
-        let events = await this.#api.listEvents(record.sessionId, since ? { createdAtGte: since } : {});
-        let index = events.findIndex((e) => e.id === mark);
-        if (index < 0 && since) {
-            events = await this.#api.listEvents(record.sessionId);
-            index = events.findIndex((e) => e.id === mark);
+    /** The session waits for tool results (Switchboard answers its own) or for confirmations (people answer). */
+    async #requiresAction(
+        entry: SessionEntry,
+        eventIds: string[],
+        byId: Map<string, SessionEvent>
+    ): Promise<'people' | 'agent' | 'pending'> {
+        const sb = this.#sb;
+        const missing = eventIds.filter((id) => !byId.has(id));
+        if (missing.length > 0) {
+            const recent = await sb.workspaces.get(entry.workspaceId).listEvents(entry.sessionId, {
+                order: 'desc',
+                max: 200,
+            });
+            for (const event of recent) if (!byId.has(event.id)) byId.set(event.id, event);
         }
-        if (index >= 0) return events.slice(index + 1);
-        const last = events.at(-1);
-        this.#log.warn(
-            { sessionId: record.sessionId, mark },
-            'watermark event not found, skipping to the latest event'
-        );
-        if (last) await this.#advance(record, last);
-        return undefined;
+        const confirmations: ToolUseEvent[] = [];
+        let pending = false;
+        for (const id of eventIds) {
+            const event = byId.get(id);
+            if (event?.type === 'agent.custom_tool_use') {
+                if ((await sb.tools.handle(entry.sessionId, event)) === 'pending') pending = true;
+            } else if (event?.type === 'agent.tool_use' || event?.type === 'agent.mcp_tool_use') {
+                confirmations.push(event);
+            }
+        }
+        if (pending) return 'pending';
+        if (confirmations.length === 0) return 'agent';
+        let current = entry;
+        if (!current.rootId) current = (await sb.jobs.moveToThread(current, 'needs_confirmation')) ?? current;
+        for (const event of confirmations) await sb.cards.askConfirmation(current, event);
+        return confirmations.length === eventIds.length ? 'people' : 'agent';
     }
 
-    /** Posts collected text and a notice into the thread, replacing the "working…" message with the first part. */
-    async #flush(record: SessionRecord, text: string[], notice: string | undefined) {
-        const parts = text.splice(0);
-        if (notice) parts.push(notice);
-        const chunks = parts.length > 0 ? splitMessage(parts.join('\n\n')) : [];
-        const [first, ...rest] = chunks;
-        if (first === undefined) {
-            await this.#removeWorking(record);
+    /** After a turn ended: release the lease when the session is really idle, else keep following. */
+    async #maybeRelease(sessionId: string, waitingForPeople: boolean) {
+        const sb = this.#sb;
+        if (!waitingForPeople) return;
+        const entry = await sb.sessions.get(sessionId);
+        if (!entry || entry.state !== 'active') {
+            this.#stop(sessionId);
             return;
         }
-        const working = record.workingMessageId;
-        record.workingMessageId = undefined;
-        if (working) {
-            try {
-                await this.#gateway.update(record.channelKey, record.rootId, working, { text: first });
-            } catch (error) {
-                this.#log.warn({ err: error, sessionId: record.sessionId }, 'could not update working message');
-                await this.#gateway.reply(record.channelKey, record.rootId, { text: first });
-            }
-        } else {
-            await this.#gateway.reply(record.channelKey, record.rootId, { text: first });
-        }
-        for (const chunk of rest) await this.#gateway.reply(record.channelKey, record.rootId, { text: chunk });
+        const session = await sb.workspaces.get(entry.workspaceId).retrieveSession(sessionId);
+        if (session.status !== 'idle') return;
+        this.#stop(sessionId);
+        await this.#release(sessionId);
+        // a message may have arrived between the check and the release: look once more
+        const again = await sb.workspaces.get(entry.workspaceId).retrieveSession(sessionId);
+        if (again.status === 'running') await this.wake(sessionId);
     }
 
-    async #removeWorking(record: SessionRecord) {
-        const working = record.workingMessageId;
-        if (!working) return;
-        record.workingMessageId = undefined;
+    /**
+     * Nothing new after the watermark (the session was woken late, by a webhook or the reconciler): release an
+     * idle session, end one that was archived or deleted without an event.
+     */
+    async #checkQuiet(entry: SessionEntry) {
+        const sb = this.#sb;
+        let session: Awaited<ReturnType<ReturnType<typeof sb.workspaces.get>['retrieveSession']>>;
         try {
-            await this.#gateway.delete(record.channelKey, record.rootId, working);
+            session = await sb.workspaces.get(entry.workspaceId).retrieveSession(entry.sessionId);
         } catch (error) {
-            this.#log.warn({ err: error, sessionId: record.sessionId }, 'could not delete working message');
+            if (error instanceof APIError && error.status === 404) {
+                await sb.sessions.end(entry.sessionId, 'deleted');
+                this.#stop(entry.sessionId);
+                return;
+            }
+            throw error;
         }
-    }
-
-    /** Posts a confirmation card for each tool call the session waits on. */
-    async #requestConfirmations(record: SessionRecord, eventIds: string[], events: SessionEvent[]) {
-        for (const eventId of eventIds) {
-            const event = events.find((e): e is ToolUseEvent => e.id === eventId && isToolUse(e));
-            if (!event || event.evaluated_permission !== 'ask') continue;
-            const tool = event.type === 'agent.mcp_tool_use' ? `${event.mcp_server_name} / ${event.name}` : event.name;
-            await postApprovalCard(
-                this.#store,
-                this.#gateway,
-                {
-                    // Deterministic, so a repeated pass does not post the card twice.
-                    cardId: `tc_${event.id}`,
-                    kind: 'tool_confirmation',
-                    sessionId: record.sessionId,
-                    channelKey: record.channelKey,
-                    rootId: record.rootId,
-                    title: `Allow tool call: ${tool}?`,
-                    summary: 'The agent is waiting for confirmation before it runs this tool.',
-                    steps: [clip(JSON.stringify(event.input, null, 2), 1500)],
-                    toolUseId: event.id,
-                },
-                this.#expiryHours
-            );
+        if (session.status === 'terminated' || session.archived_at !== null) {
+            await sb.sessions.end(entry.sessionId, entry.stopping ? 'archived' : 'terminated');
+            this.#stop(entry.sessionId);
+            return;
         }
-    }
-
-    async #advance(record: SessionRecord, event: SessionEvent) {
-        record.watermarkEventId = event.id;
-        record.watermarkAt = ('processed_at' in event ? event.processed_at : undefined) ?? new Date().toISOString();
-        await this.#save(record);
-    }
-
-    async #save(record: SessionRecord) {
-        record.updatedAt = new Date().toISOString();
-        await this.#store.putSession(record);
+        if (session.status === 'idle') await this.#maybeRelease(entry.sessionId, true);
     }
 }

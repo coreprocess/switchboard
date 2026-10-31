@@ -1,7 +1,7 @@
 /**
  * Builds the Teams app package (manifest.json + icons, zipped) for upload as a custom app.
  *
- *   node teams-app/build.ts --bot-id <app id> [--app-id <guid>] [--version 1.0.0] [--name Switchboard]
+ *   node teams-app/build.ts --bot-id <app id> [--app-id <guid>] [--version 2.0.0] [--name Switchboard]
  *       [--short-description …] [--full-description …] [--developer-name …] [--website-url …]
  *       [--privacy-url …] [--terms-url …] [--out teams-app/build/switchboard.zip]
  */
@@ -18,14 +18,15 @@ const { values } = parseArgs({
     options: {
         'bot-id': { type: 'string' },
         'app-id': { type: 'string' },
-        version: { type: 'string', default: '1.0.0' },
+        version: { type: 'string', default: '2.0.0' },
         name: { type: 'string', default: 'Switchboard' },
         'short-description': { type: 'string', default: 'Talk to Claude agents in this channel.' },
         'full-description': {
             type: 'string',
             default:
-                'Connects this channel to a Claude agent. Mention the app to start a conversation; replies in the ' +
-                'thread go to the same agent session. Agents post updates and ask for approval here.',
+                'Connects this channel to Claude agents. Every new post starts a conversation with the channel’s ' +
+                'agent, replies in the thread reach the same session, and agents post updates and cards here. ' +
+                'Admins set the channel up with @Switchboard settings.',
         },
         'developer-name': { type: 'string', default: 'Switchboard' },
         'website-url': { type: 'string', default: REPO },
