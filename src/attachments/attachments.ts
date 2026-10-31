@@ -1,6 +1,5 @@
 import sharp from 'sharp';
 import type { ContentBlock } from '../claude/templates.ts';
-import type { AttachmentRef } from '../conversations/log.ts';
 import type { Switchboard } from '../switchboard.ts';
 
 /**
@@ -17,6 +16,15 @@ export interface IncomingAttachment {
     data?: Uint8Array;
     /** Why it could not be fetched. */
     problem?: string;
+}
+
+/** An attachment as recorded with a message: passed on (with its file ID) or not (with the reason). */
+export interface AttachmentRef {
+    name: string;
+    mediaType: string;
+    size: number;
+    fileId?: string;
+    unsupported?: string;
 }
 
 export interface PreparedAttachments {
@@ -68,13 +76,8 @@ export class Attachments {
         this.#sb = sb;
     }
 
-    /** Uploads what can be passed on to the workspace's Files API and records it with its owner. */
-    async prepare(
-        workspaceId: string,
-        owner: string,
-        messageId: string,
-        attachments: IncomingAttachment[]
-    ): Promise<PreparedAttachments> {
+    /** Passes on the attachments of an incoming message; records the uploads with their conversation. */
+    async prepare(workspaceId: string, owner: string, attachments: IncomingAttachment[]): Promise<PreparedAttachments> {
         const sb = this.#sb;
         const prepared: PreparedAttachments = { blocks: [], refs: [], rejected: [] };
         const enabled = sb.settings.attachmentTypes.flatMap((type) => (HANDLERS[type] ? [HANDLERS[type]] : []));
@@ -93,34 +96,63 @@ export class Attachments {
                 prepared.rejected.push({ ...ref, unsupported: 'too large' });
                 continue;
             }
-            try {
-                const { data, mediaType } = await handler.prepare({ ...attachment, data: attachment.data });
-                const fileId = await sb.workspaces.get(workspaceId).uploadFile(attachment.name, mediaType, data);
-                await sb.entities.files.upsert({
-                    owner,
-                    fileId,
-                    workspaceId,
-                    kind: 'attachment',
-                    messageId,
-                    mediaType,
-                    name: attachment.name,
-                    size: data.byteLength,
-                    createdAt: sb.now().toISOString(),
-                });
-                prepared.blocks.push(handler.block(fileId));
-                prepared.refs.push({ ...ref, mediaType, size: data.byteLength, fileId });
-                sb.log.debug({ fileId, size: data.byteLength }, 'attachment passed on');
-            } catch (error) {
-                sb.log.warn({ err: error, size: attachment.size }, 'attachment not passed on');
+            const fileId = await this.#upload(
+                workspaceId,
+                owner,
+                handler,
+                attachment.name,
+                attachment.data,
+                attachment.mediaType
+            );
+            if (!fileId) {
                 prepared.rejected.push({ ...ref, unsupported: 'could not be processed' });
+                continue;
             }
+            prepared.blocks.push(handler.block(fileId));
+            prepared.refs.push({ ...ref, fileId });
         }
         return prepared;
     }
-}
 
-/** Image blocks for attachments already uploaded (continuations show the images of the latest messages). */
-export const imageBlocks = (refs: AttachmentRef[]): ContentBlock[] =>
-    refs
-        .filter((ref) => ref.fileId && IMAGE_TYPES.includes(ref.mediaType))
-        .map((ref) => imageHandler.block(ref.fileId ?? ''));
+    /** Uploads an image from a thread's history; `undefined` when it is not an image Claude takes. */
+    async uploadImage(workspaceId: string, owner: string, name: string, data: Uint8Array, mediaType: string) {
+        if (!imageHandler.accepts({ name, mediaType, size: data.byteLength })) return undefined;
+        if (data.byteLength > this.#sb.settings.attachmentMaxBytes) return undefined;
+        return this.#upload(workspaceId, owner, imageHandler, name, data, mediaType);
+    }
+
+    async #upload(
+        workspaceId: string,
+        owner: string,
+        handler: Handler,
+        name: string,
+        original: Uint8Array,
+        originalType: string
+    ): Promise<string | undefined> {
+        const sb = this.#sb;
+        try {
+            const { data, mediaType } = await handler.prepare({
+                name,
+                mediaType: originalType,
+                size: original.byteLength,
+                data: original,
+            });
+            const fileId = await sb.workspaces.get(workspaceId).uploadFile(name, mediaType, data);
+            await sb.entities.files.upsert({
+                owner,
+                fileId,
+                workspaceId,
+                kind: 'image',
+                mediaType,
+                name,
+                size: data.byteLength,
+                createdAt: sb.now().toISOString(),
+            });
+            sb.log.debug({ fileId, size: data.byteLength }, 'image passed on');
+            return fileId;
+        } catch (error) {
+            sb.log.warn({ err: error, size: original.byteLength }, 'image not passed on');
+            return undefined;
+        }
+    }
+}

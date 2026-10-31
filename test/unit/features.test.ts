@@ -11,24 +11,7 @@ describe('features', () => {
     const results: Record<string, { text: string; isError: boolean }> = {};
 
     before(async () => {
-        h = await startHarness({
-            history: [
-                {
-                    at: '2026-10-30T08:00:00Z',
-                    name: 'Jane Doe',
-                    aad: 'aaaa',
-                    text: 'Old question from before the binding',
-                    fromApp: false,
-                },
-                {
-                    at: '2026-10-30T08:05:00Z',
-                    name: 'Jane Doe',
-                    aad: 'aaaa',
-                    text: 'The reply being delivered',
-                    fromApp: false,
-                },
-            ],
-        });
+        h = await startHarness();
         await h.bind({ job_deployment: `${WORKSPACE}|depl_job`, job_cron: '0 3 * * *', job_enabled: 'false' });
         h.claude.agent = async (turn: Turn) => {
             const last = turn.text.split('\n').at(-1) ?? '';
@@ -121,13 +104,38 @@ describe('features', () => {
         assert.ok(h.thread(root.id).some((t) => t.startsWith('ℹ️ Not passed to the agent: report.xlsx')));
     });
 
-    it('reads the history from Teams for a thread Switchboard does not know', async () => {
-        await h.post(h.message('The reply being delivered', { rootId: '1793300000000' }));
-        await eventually(() => h.thread('1793300000000').some((t) => t.startsWith('Echo:')));
+    it('reads the history from Teams for a thread from before the binding', async () => {
+        const old = h.message('Old question from before the binding');
+        h.connector.human({ ...old, timestamp: '2026-10-30T08:00:00.000Z' }, { subject: 'Import failures' });
+        h.connector.human({
+            ...h.message('An old answer', { rootId: old.id, from: { id: '29:o', name: 'Otto', aadObjectId: 'cccc' } }),
+            timestamp: '2026-10-30T08:05:00.000Z',
+        });
+        const created = h.claude.createRequests.length;
+        await h.post(h.message('The reply being delivered', { rootId: old.id }));
+        await eventually(() => h.claude.createRequests.length === created + 1);
         const first = h.firstText();
-        assert.match(first, /^\[switchboard:continuation\] previous_session=none reason=history_from_teams at=/);
-        assert.ok(first.includes('Old question from before the binding'));
+        assert.match(first, /^\[switchboard:continuation\] previous_session=none reason=first_session at=/);
+        assert.match(first, /2026-10-30T08:00:00.000Z · person "Jane Doe" \(aad \S+\) wrote:\n {4}Old question/);
+        assert.match(first, /person "Otto" \(aad cccc\) wrote:\n {4}An old answer/);
         assert.match(first, /\[teams\] from="Jane Doe".*\nThe reply being delivered$/);
+        assert.equal(first.split('The reply being delivered').length, 2, 'the delivered message only once');
+    });
+
+    it('never starts a session for a command; the first other message of the thread does', async () => {
+        const created = h.claude.createRequests.length;
+        const status = h.message('status', { mention: true });
+        await h.post(status);
+        await eventually(() =>
+            h.connector.messages.some((m) => String(m.activity.text).startsWith('**Switchboard in ops**'))
+        );
+        assert.equal(h.claude.createRequests.length, created);
+        await h.post(h.message('What does that mean?', { rootId: status.id }));
+        await eventually(() => h.claude.createRequests.length === created + 1);
+        const first = h.firstText();
+        assert.match(first, /^\[switchboard:continuation\] previous_session=none reason=first_session/);
+        assert.match(first, /person "Jane Doe" .*wrote:\n {4}@Switchboard status/);
+        assert.match(first, /app "Switchboard" wrote:\n {4}\*\*Switchboard in ops\*\*/);
     });
 
     it('disconnects: archives the sessions and ignores later messages', async () => {

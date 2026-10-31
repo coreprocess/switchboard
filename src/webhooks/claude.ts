@@ -56,18 +56,11 @@ const vaultRefreshFailed = async (sb: Switchboard, workspaceId: string, vaultId:
             if (deployment?.vault_ids.includes(vaultId)) uses = true;
         }
         if (!uses) continue;
-        await sb.gateway
-            .postThread(
-                { teamId: binding.teamId, channelId: binding.channelId },
-                {
-                    text:
-                        `⚠️ A credential in vault \`${vaultId}\` could not be refreshed. Agent sessions of this channel ` +
-                        'may fail to reach the service it signs in to until the credential is renewed in the Claude Console.',
-                }
-            )
-            .catch((error: unknown) =>
-                sb.log.warn({ err: error, channelId: binding.channelId }, 'vault note not posted')
-            );
+        await sb.conversations.notice(
+            binding,
+            `⚠️ A credential in vault \`${vaultId}\` could not be refreshed. Agent sessions of this channel may ` +
+                'fail to reach the service it signs in to until the credential is renewed in the Claude Console.'
+        );
     }
 };
 

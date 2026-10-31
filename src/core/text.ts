@@ -51,6 +51,10 @@ export const conversationStartHeader = (fromSession: string, postedAt: Date) =>
 export const continuationHeader = (previousSession: string, reason: string, at: Date) =>
     `[switchboard:continuation] previous_session=${bare(previousSession)} reason=${bare(reason)} at=${at.toISOString()}`;
 
+export const sessionMessageHeader = (fromSession: string, fromKind: string, fromConversation: string, at: Date) =>
+    `[switchboard:session-message] from_session=${bare(fromSession)} from_kind=${bare(fromKind)} ` +
+    `from_conversation=${bare(fromConversation)} at=${at.toISOString()}`;
+
 export const jobFailedHeader = (reason: string, at: Date) =>
     `[switchboard:job-failed] reason=${bare(reason)} at=${at.toISOString()}`;
 

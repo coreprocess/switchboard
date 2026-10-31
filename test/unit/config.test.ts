@@ -27,12 +27,12 @@ describe('settings', () => {
         const settings = loadSettings(base);
         assert.equal(settings.port, 8080);
         assert.equal(settings.defaultTimezone, 'Europe/Berlin');
-        assert.equal(settings.defaultJobMaxRuntimeMin, 60);
+        assert.equal(settings.jobMaxRuntimeHours, 24);
         assert.equal(settings.sessionArchiveAfterDays, 30);
         assert.equal(settings.conversationRetentionDays, 90);
         assert.equal(settings.attachmentMaxBytes, 20 * 1024 * 1024);
         assert.deepEqual(settings.attachmentTypes, ['image']);
-        assert.equal(settings.logInlineLimitBytes, 50 * 1024);
+        assert.equal(settings.historyInlineLimitBytes, 50 * 1024);
         assert.deepEqual(settings.admins, []);
         assert.deepEqual(settings.store, {
             kind: 'azure-tables',

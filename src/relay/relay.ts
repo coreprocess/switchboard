@@ -44,7 +44,7 @@ interface Follower {
  * Follows sessions that are working (concept: "Several pods on Table Storage"). One pod follows a session at a
  * time, holding the session lease in the store (renewed every 20 s, valid for 60 s). The holder drains the
  * session's events from the stored watermark: it answers custom tool calls, posts final answers and handles
- * pauses and ends. A session waiting only for a person holds no lease.
+ * pauses and ends. A session waiting only for a person or for the end of a `wait` holds no lease.
  *
  * Draining is idempotent: the watermark only advances at stable points (turn end, pause, end), so a pod that
  * takes over repeats the open turn's events, and tool calls are carried out at most once (`Tools`).
@@ -361,7 +361,11 @@ export class Relay {
         }
     }
 
-    /** The session waits for tool results (Switchboard answers its own) or for confirmations (people answer). */
+    /**
+     * The session waits for tool results (Switchboard answers its own), for confirmations (people answer) or for
+     * the end of a `wait`. While anything stays open the session waits for the outside world (`people`): its
+     * lease is released, and whoever answers wakes it.
+     */
     async #requiresAction(
         entry: SessionEntry,
         eventIds: string[],
@@ -378,20 +382,24 @@ export class Relay {
         }
         const confirmations: ToolUseEvent[] = [];
         let pending = false;
+        let waiting = false;
         for (const id of eventIds) {
             const event = byId.get(id);
             if (event?.type === 'agent.custom_tool_use') {
-                if ((await sb.tools.handle(entry.sessionId, event)) === 'pending') pending = true;
+                const state = await sb.tools.handle(entry.sessionId, event);
+                if (state === 'pending') pending = true;
+                if (state === 'waiting') waiting = true;
             } else if (event?.type === 'agent.tool_use' || event?.type === 'agent.mcp_tool_use') {
                 confirmations.push(event);
             }
         }
         if (pending) return 'pending';
-        if (confirmations.length === 0) return 'agent';
-        let current = entry;
-        if (!current.rootId) current = (await sb.jobs.moveToThread(current, 'needs_confirmation')) ?? current;
-        for (const event of confirmations) await sb.cards.askConfirmation(current, event);
-        return confirmations.length === eventIds.length ? 'people' : 'agent';
+        if (confirmations.length > 0) {
+            let current = entry;
+            if (!current.rootId) current = (await sb.jobs.moveToThread(current, 'needs_confirmation')) ?? current;
+            for (const event of confirmations) await sb.cards.askConfirmation(current, event);
+        }
+        return waiting || confirmations.length > 0 ? 'people' : 'agent';
     }
 
     /** After a turn ended: release the lease when the session is really idle, else keep following. */

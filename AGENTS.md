@@ -37,8 +37,9 @@ Switchboard sits between people in Teams and agents; both sides are untrusted.
 - Validate everything that arrives from Teams (activities, `channelData`, card actions) and from agents (tool
   inputs, card JSON) before using it. Parse with schemas; never assume a field is present.
 - Only Switchboard produces `[switchboard:…]` and `[teams]` header lines. Every human-written string that reaches an
-  agent (message text, display names, card data) goes through `neutralise` / `quoted` (`src/core/text.ts`). A change
-  to these rules comes with cases in `test/unit/text.test.ts`.
+  agent (message text, display names, card data, histories read from Teams, descriptions) goes through
+  `neutralise` / `quoted` (`src/core/text.ts`). A change to these rules comes with cases in
+  `test/unit/text.test.ts`.
 - A card click counts once (conditional write `open → locked`), only from the card's own team and channel, and the
   clicker's identity comes from the verified activity, never from the card's data. Admin actions are checked against
   `SWITCHBOARD_ADMINS` the same way. Changes to these paths come with cases in `test/unit/tools-cards.test.ts` and
@@ -62,12 +63,12 @@ Switchboard runs on several pods from the start; Table Storage is the only share
 ## Generic by design
 
 - No domain logic: Switchboard connects channels to deployments, keeps threads and sessions one to one, runs jobs,
-  passes messages and cards through and keeps the conversation log. What to post and how to react is the agents'
-  job; agent cards pass through unchanged apart from Switchboard's card ID.
+  passes messages and cards through and augments Teams threads (Teams is the truth; no message copies). What to
+  post and how to react is the agents' job; agent cards pass through unchanged apart from Switchboard's card ID.
 - Everything deployment-specific is configuration (environment variables) or data an admin manages in Teams
   (bindings, jobs). New behaviour that only one deployment needs becomes a configuration option or stays out.
-- Teams stays behind `ChannelGateway` (`src/core/gateway.ts`), `HistoryReader` and `src/teams/`; sessions,
-  conversations, tools, cards, jobs and the relay do not import Teams code, so another platform could be added.
+- Teams stays behind `ChannelPlatform` (`src/core/platform.ts`) and `src/teams/`; sessions, conversations, tools,
+  cards, jobs and the relay do not import Teams code, so another platform could be added.
 - Switchboard's system prompt appendix (`prompt/switchboard-appendix.md`) stays short and generic; it may not
   contain anything deployment-specific.
 

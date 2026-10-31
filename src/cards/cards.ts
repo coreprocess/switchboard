@@ -1,4 +1,4 @@
-import type { CardJson } from '../core/gateway.ts';
+import type { CardJson } from '../core/platform.ts';
 import { clip } from '../core/text.ts';
 
 /**
@@ -133,3 +133,18 @@ export const confirmationCard = (cardId: string, details: ConfirmationDetails): 
 
 /** A short, readable summary of a tool input for the confirmation card. */
 export const summariseInput = (input: unknown): string => clip(JSON.stringify(input, null, 2) ?? '', 2_000);
+
+/** The text a card shows (its TextBlocks and facts), for histories and summaries. */
+export const cardText = (card: CardJson): string => {
+    const lines: string[] = [];
+    transform(card, (object) => {
+        if (object.type === 'TextBlock' && typeof object.text === 'string') lines.push(object.text);
+        if (object.type === 'FactSet' && Array.isArray(object.facts)) {
+            for (const fact of object.facts) {
+                if (isObject(fact)) lines.push(`${String(fact.title ?? '')}: ${String(fact.value ?? '')}`);
+            }
+        }
+        return object;
+    });
+    return lines.join('\n');
+};

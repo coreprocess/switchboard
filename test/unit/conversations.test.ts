@@ -31,7 +31,17 @@ describe('conversations', () => {
         assert.match(request.agent.system, /You watch the deployments\./);
         assert.ok(request.agent.system.includes(APPENDIX_HEADING));
         const toolNames = request.agent.tools.filter((t) => t.type === 'custom').map((t) => t.name);
-        assert.deepEqual(toolNames, ['start_new_conversation', 'send_update', 'show_card', 'update_card']);
+        assert.deepEqual(toolNames, [
+            'send_update',
+            'show_card',
+            'update_card',
+            'describe_conversation',
+            'list_conversations',
+            'read_conversation',
+            'send_to_conversation',
+            'start_new_conversation',
+            'wait',
+        ]);
         assert.equal(request.environment_id, 'env_test');
         assert.deepEqual(request.vault_ids, ['vlt_test']);
         assert.equal(request.metadata.switchboard_kind, 'conversation');

@@ -67,8 +67,9 @@ describe('two pods on Table Storage (Azurite)', () => {
     it('creates one session per thread with messages on both pods', async () => {
         const before = h.claude.createRequests.length;
         const root = h.message('First');
-        const replies = [h.message('Second', { rootId: root.id }), h.message('Third', { rootId: root.id })];
-        await Promise.all([h.post(root, 0), h.post(replies[0], 1), h.post(replies[1], 0)]);
+        const second = h.message('Second', { rootId: root.id });
+        const third = h.message('Third', { rootId: root.id });
+        await Promise.all([h.post(root, 0), h.post(second, 1), h.post(third, 0)]);
         await eventually(() => h.thread(root.id).some((t) => t.startsWith('Echo:')), 15_000);
         await sleep(500);
         assert.equal(h.claude.createRequests.length, before + 1);

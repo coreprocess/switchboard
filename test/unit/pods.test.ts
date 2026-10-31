@@ -110,6 +110,50 @@ describe('several pods on one store', () => {
         });
     });
 
+    it('answers a wait once, whichever pods see its deadline or a message', async () => {
+        const [a, b] = h.instances;
+        assert.ok(a && b);
+        const root = h.message('waiting session');
+        await h.post(root, 0);
+        await eventually(() => h.thread(root.id).includes('Echo: waiting session'));
+        const sessionId = [...h.claude.sessions.keys()].at(-1) ?? '';
+        const results = (eventId: unknown) =>
+            (h.claude.sessions.get(sessionId)?.events ?? []).filter(
+                (e) => e.type === 'user.custom_tool_result' && e.custom_tool_use_id === eventId
+            );
+        const wait = async (fields: { waitUntil: string; waitWatch?: string }) => {
+            const event = h.claude.emit(sessionId, { type: 'agent.custom_tool_use', name: 'wait', input: {} });
+            await a.sb.entities.toolCalls.insert({
+                sessionId,
+                eventId: String(event.id),
+                tool: 'wait',
+                status: 'waiting',
+                startedAt: new Date().toISOString(),
+                ...fields,
+            });
+            return event.id;
+        };
+
+        const due = await wait({ waitUntil: new Date(Date.now() + offset - 1_000).toISOString() });
+        await Promise.all([a.sb.waits.tick(), b.sb.waits.tick()]);
+        await eventually(() => results(due).length > 0);
+        await sleep(300);
+        assert.equal(results(due).length, 1, 'a due wait is answered once');
+
+        const watched = await wait({
+            waitUntil: new Date(Date.now() + offset + 60_000).toISOString(),
+            waitWatch: `${CHANNEL}/1793300000000`,
+        });
+        const message = { from: 'Jane Doe', at: new Date().toISOString(), text: 'news' };
+        await Promise.all([
+            a.sb.waits.conversationMessage(CHANNEL, '1793300000000', message),
+            b.sb.waits.conversationMessage(CHANNEL, '1793300000000', message),
+        ]);
+        await sleep(300);
+        assert.equal(results(watched).length, 1, 'a wait ended by a message is answered once');
+        assert.match(String(JSON.stringify(results(watched)[0]?.content)), /conversation_message/);
+    });
+
     it('accepts card clicks and replies on any pod', async () => {
         const root = h.message('which pod?');
         await h.post(root, 1);

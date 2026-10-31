@@ -4,9 +4,11 @@ import { CardService } from './cards/service.ts';
 import type { ClaudeWorkspaces } from './claude/api.ts';
 import type { Templates } from './claude/templates.ts';
 import type { Settings } from './config/env.ts';
-import { Conversations, type HistoryReader } from './conversations/conversations.ts';
-import type { ChannelGateway } from './core/gateway.ts';
+import { Conversations } from './conversations/conversations.ts';
+import { Delivery } from './conversations/delivery.ts';
+import { HistoryReader } from './conversations/history.ts';
 import type { Logger } from './core/logger.ts';
+import type { ChannelPlatform } from './core/platform.ts';
 import { Jobs } from './jobs/jobs.ts';
 import { Lifecycle } from './lifecycle/lifecycle.ts';
 import { Reconciler } from './relay/reconciler.ts';
@@ -14,14 +16,14 @@ import { Relay } from './relay/relay.ts';
 import { Sessions } from './sessions/sessions.ts';
 import type { Entities } from './store/entities.ts';
 import { Tools } from './tools/tools.ts';
+import { Waits } from './tools/waits.ts';
 
 export interface Core {
     settings: Settings;
     entities: Entities;
     workspaces: ClaudeWorkspaces;
     templates: Templates;
-    gateway: ChannelGateway;
-    history: HistoryReader;
+    platform: ChannelPlatform;
     log: Logger;
     /** Identifies this pod in session leases. */
     podId?: string;
@@ -39,6 +41,7 @@ export interface Timing {
     schedulerMs: number;
     claimMs: number;
     claimWaitMs: number;
+    waitTickMs: number;
 }
 
 const DEFAULT_TIMING: Timing = {
@@ -49,6 +52,7 @@ const DEFAULT_TIMING: Timing = {
     schedulerMs: 15_000,
     claimMs: 90_000,
     claimWaitMs: 30_000,
+    waitTickMs: 10_000,
 };
 
 /** One Switchboard instance (pod): the shared parts and the services, which reach each other through it. */
@@ -57,8 +61,7 @@ export class Switchboard {
     readonly entities: Entities;
     readonly workspaces: ClaudeWorkspaces;
     readonly templates: Templates;
-    readonly gateway: ChannelGateway;
-    readonly history: HistoryReader;
+    readonly platform: ChannelPlatform;
     readonly log: Logger;
     readonly podId: string;
     readonly timing: Timing;
@@ -66,9 +69,12 @@ export class Switchboard {
 
     readonly sessions: Sessions;
     readonly conversations: Conversations;
+    readonly history: HistoryReader;
+    readonly delivery: Delivery;
     readonly cards: CardService;
     readonly attachments: Attachments;
     readonly tools: Tools;
+    readonly waits: Waits;
     readonly relay: Relay;
     readonly jobs: Jobs;
     readonly lifecycle: Lifecycle;
@@ -79,8 +85,7 @@ export class Switchboard {
         this.entities = core.entities;
         this.workspaces = core.workspaces;
         this.templates = core.templates;
-        this.gateway = core.gateway;
-        this.history = core.history;
+        this.platform = core.platform;
         this.log = core.log;
         this.podId = core.podId ?? `pod-${randomUUID()}`;
         this.timing = { ...DEFAULT_TIMING, ...core.timing };
@@ -88,9 +93,12 @@ export class Switchboard {
 
         this.sessions = new Sessions(this);
         this.conversations = new Conversations(this);
+        this.history = new HistoryReader(this);
+        this.delivery = new Delivery(this);
         this.cards = new CardService(this);
         this.attachments = new Attachments(this);
         this.tools = new Tools(this);
+        this.waits = new Waits(this);
         this.relay = new Relay(this);
         this.jobs = new Jobs(this);
         this.lifecycle = new Lifecycle(this);
@@ -101,15 +109,17 @@ export class Switchboard {
         return this.#now();
     }
 
-    /** Starts the background loops: reconciler (which also runs the daily cleanup) and job scheduler. */
+    /** Starts the background loops: reconciler (which also runs the daily cleanup), job scheduler, wait timer. */
     start() {
         this.reconciler.start();
         this.jobs.start();
+        this.waits.start();
     }
 
     /** Stops the loops and releases this pod's session leases, so another pod takes over at once. */
     async stop() {
         this.jobs.stop();
+        this.waits.stop();
         await this.reconciler.stop();
         await this.relay.close();
     }

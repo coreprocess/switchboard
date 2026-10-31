@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import type { SessionEvent } from '../claude/api.ts';
-import type { CardJson, ChannelRef } from '../core/gateway.ts';
+import { channelOf } from '../conversations/conversations.ts';
+import type { CardJson, ChannelRef } from '../core/platform.ts';
 import { cardHeader, type Person } from '../core/text.ts';
 import type { Card, SessionEntry } from '../store/entities.ts';
 import type { Switchboard } from '../switchboard.ts';
@@ -31,6 +32,15 @@ export interface CardClick {
 
 export const newCardId = () => `card_${randomBytes(12).toString('base64url')}`;
 
+/** The click as histories show it later; the verb of a confirmation is its decision. */
+const lastClick = (click: CardClick, at: Date, data: string) => ({
+    lastClickVerb: click.verb,
+    lastClickBy: click.by.name ?? 'unknown',
+    lastClickAad: click.by.aadObjectId,
+    lastClickAt: at.toISOString(),
+    lastClickData: data,
+});
+
 /** Agent cards and tool confirmations: showing, updating, the first click wins, closing when the session ends. */
 export class CardService {
     readonly #sb: Switchboard;
@@ -57,16 +67,28 @@ export class CardService {
         return json;
     }
 
-    async #refresh(card: Card) {
+    /** Shows the card's current state in Teams; `activity` when the change counts as activity. */
+    async #refresh(card: Card, activity: boolean) {
         if (!card.activityId) return;
-        const channel = { teamId: card.teamId, channelId: card.channelId };
-        await this.#sb.gateway.update(channel, card.rootId, card.activityId, { card: this.render(card) });
+        await this.#sb.conversations.edit(
+            channelOf(card),
+            card.rootId,
+            card.activityId,
+            { card: this.render(card) },
+            { kind: 'card', sessionId: card.sessionId, activity }
+        );
     }
 
-    async #conversationId(entry: SessionEntry): Promise<string> {
-        const conversation = entry.rootId ? await this.#sb.conversations.get(entry.channelId, entry.rootId) : undefined;
-        if (!conversation) throw new CardError('this session has no conversation yet');
-        return conversation.conversationId;
+    /** Posts a card that is recorded already and remembers the Teams message that shows it. */
+    async #post(card: Card, json: CardJson) {
+        const sb = this.#sb;
+        const { messageId } = await sb.conversations.post(
+            channelOf(card),
+            card.rootId,
+            { card: json },
+            { kind: 'card', sessionId: card.sessionId }
+        );
+        await sb.entities.cards.modify(card.cardId, '', (current) => ({ ...current, activityId: messageId }));
     }
 
     /** `show_card`: posts the card in the session's thread. */
@@ -83,21 +105,12 @@ export class CardService {
             teamId: entry.teamId,
             channelId: entry.channelId,
             rootId: entry.rootId,
-            conversationId: await this.#conversationId(entry),
             json: JSON.stringify(prepared),
             state: 'open',
             createdAt: sb.now().toISOString(),
         };
         await sb.entities.cards.upsert(card);
-        const { messageId } = await sb.gateway.reply(sb.sessions.channelOf(entry), entry.rootId, { card: prepared });
-        await sb.entities.cards.modify(cardId, '', (current) => ({ ...current, activityId: messageId }));
-        await sb.conversations.record(entry.channelId, entry.rootId, {
-            kind: 'card',
-            event: 'shown',
-            cardId,
-            session: entry.sessionId,
-            json: card.json,
-        });
+        await this.#post(card, prepared);
         return cardId;
     }
 
@@ -129,14 +142,7 @@ export class CardService {
         });
         if (problem) throw new CardError(problem);
         if (!updated) throw new CardError(`unknown card '${cardId}'`);
-        await this.#refresh(updated);
-        await sb.conversations.record(updated.channelId, updated.rootId, {
-            kind: 'card',
-            event: 'updated',
-            cardId,
-            session: entry.sessionId,
-            json: updated.json,
-        });
+        await this.#refresh(updated, true);
     }
 
     /**
@@ -155,6 +161,7 @@ export class CardService {
         if (!fromCard) return { message: 'This click does not come from the card’s channel.' };
         if (card.state !== 'open') return this.render(card);
         const at = sb.now();
+        const data = JSON.stringify(click.data, null, 2);
         const locked = await sb.entities.cards.update(stored, {
             ...card,
             state: 'locked',
@@ -162,12 +169,13 @@ export class CardService {
             lockedAad: click.by.aadObjectId,
             lockedAt: at.toISOString(),
             lockedChoice: buttonTitle(JSON.parse(card.json) as CardJson, click.verb),
+            ...lastClick(click, at, data),
         });
         if (!locked) {
             const latest = await sb.entities.cards.get(click.cardId);
             return latest ? this.render(latest.value) : { message: 'This card is no longer known.' };
         }
-        const data = JSON.stringify(click.data, null, 2);
+        await sb.conversations.touch(card.channelId, card.rootId);
         const session = await sb.sessions.get(card.sessionId);
         if (session?.state !== 'active') return this.render(locked.value);
         try {
@@ -179,15 +187,6 @@ export class CardService {
             await sb.entities.cards.update(locked, card);
             return { message: 'The agent could not be reached; please try again.' };
         }
-        await sb.conversations.record(card.channelId, card.rootId, {
-            kind: 'card-click',
-            cardId: card.cardId,
-            session: card.sessionId,
-            verb: click.verb,
-            by: click.by.name ?? 'unknown',
-            aad: click.by.aadObjectId,
-            data,
-        });
         return this.render(locked.value);
     }
 
@@ -206,23 +205,15 @@ export class CardService {
             teamId: entry.teamId,
             channelId: entry.channelId,
             rootId: entry.rootId,
-            conversationId: await this.#conversationId(entry),
             json: JSON.stringify(details),
             state: 'open',
             toolUseId: event.id,
             createdAt: sb.now().toISOString(),
         });
+        const card = inserted?.value ?? (await sb.entities.cards.get(cardId))?.value;
         // a card recorded before but never posted (the post failed, or its pod died) is posted now
-        if (!inserted && (await sb.entities.cards.get(cardId))?.value.activityId) return;
-        const card = confirmationCard(cardId, details);
-        const { messageId } = await sb.gateway.reply(sb.sessions.channelOf(entry), entry.rootId, { card });
-        await sb.entities.cards.modify(cardId, '', (current) => ({ ...current, activityId: messageId }));
-        await sb.conversations.record(entry.channelId, entry.rootId, {
-            kind: 'confirmation',
-            cardId,
-            session: entry.sessionId,
-            tool: toolName,
-        });
+        if (!card || card.activityId) return;
+        await this.#post(card, confirmationCard(cardId, details));
     }
 
     /** A click on a confirmation card: the first decision is sent to the session as a tool confirmation. */
@@ -236,18 +227,21 @@ export class CardService {
         }
         if (card.state !== 'open' || (click.verb !== VERB_ALLOW && click.verb !== VERB_DENY)) return this.render(card);
         const decision = click.verb === VERB_ALLOW ? 'allow' : 'deny';
+        const at = sb.now();
         const decided = await sb.entities.cards.update(stored, {
             ...card,
             state: 'locked',
             lockedBy: click.by.name ?? 'Someone',
             lockedAad: click.by.aadObjectId,
-            lockedAt: sb.now().toISOString(),
+            lockedAt: at.toISOString(),
             lockedChoice: decision,
+            ...lastClick(click, at, '{}'),
         });
         if (!decided) {
             const latest = await sb.entities.cards.get(click.cardId);
             return latest ? this.render(latest.value) : { message: 'This card is no longer known.' };
         }
+        await sb.conversations.touch(card.channelId, card.rootId);
         const session = await sb.sessions.get(card.sessionId);
         if (session?.state === 'active' && card.toolUseId) {
             try {
@@ -268,15 +262,6 @@ export class CardService {
                 return { message: 'The agent could not be reached; please try again.' };
             }
         }
-        const details = JSON.parse(card.json) as ConfirmationDetails;
-        await sb.conversations.record(card.channelId, card.rootId, {
-            kind: 'confirmation',
-            cardId: card.cardId,
-            session: card.sessionId,
-            tool: details.toolName,
-            decision,
-            by: click.by.name ?? 'unknown',
-        });
         return this.render(decided.value);
     }
 
@@ -291,14 +276,8 @@ export class CardService {
                 current.state === 'closed' ? undefined : { ...current, state: 'closed' }
             );
             if (!closed) continue;
-            await this.#refresh(closed.value).catch((error: unknown) => {
+            await this.#refresh(closed.value, false).catch((error: unknown) => {
                 sb.log.warn({ err: error, cardId: card.cardId }, 'closed card not updated in Teams');
-            });
-            await sb.conversations.record(card.channelId, card.rootId, {
-                kind: 'card',
-                event: 'closed',
-                cardId: card.cardId,
-                session: sessionId,
             });
         }
     }

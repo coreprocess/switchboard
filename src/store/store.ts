@@ -12,7 +12,7 @@ export const TABLES = [
     'sessions',
     'files',
     'cards',
-    'logs',
+    'posted',
     'toolcalls',
     'teamsrefs',
     'seen',

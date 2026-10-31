@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
-import { LOG_FILE_PATH } from '../../src/conversations/log.ts';
+import { HISTORY_FILE_PATH } from '../../src/conversations/history.ts';
+import { neutralise } from '../../src/core/text.ts';
 import { endNotice } from '../../src/sessions/sessions.ts';
 import { CHANNEL, eventually, type Harness, startHarness, USER } from '../helpers/harness.ts';
 import type { Turn } from '../helpers/mock-claude.ts';
@@ -20,7 +21,7 @@ describe('tools and cards', () => {
     const results: Record<string, { text: string; isError: boolean }> = {};
 
     before(async () => {
-        h = await startHarness({ env: { LOG_INLINE_LIMIT_KB: '2' } });
+        h = await startHarness({ env: { HISTORY_INLINE_LIMIT_KB: '2' } });
         await h.bind();
         h.claude.agent = async (turn: Turn) => {
             const last = turn.text.split('\n').at(-1) ?? '';
@@ -57,6 +58,8 @@ describe('tools and cards', () => {
                 results.handover = await turn.callTool('start_new_conversation', {
                     message: 'Separate topic: disk usage is growing.',
                     briefing: 'Volume /data grew 20 % in a day.',
+                    title: 'Disk usage on /data',
+                    tags: ['disk'],
                 });
                 turn.say('Opened a separate thread.');
                 return;
@@ -123,13 +126,15 @@ describe('tools and cards', () => {
         const callerSession = latestSession(h);
         const created = h.claude.createRequests.length;
         const handover = JSON.parse(results.handover?.text ?? '{}');
-        assert.match(handover.conversation_id, /^cnv_/);
-        const opening = h.connector.created.at(-1) as { activity: { text: string } };
-        assert.equal(opening.activity.text, 'Separate topic: disk usage is growing.');
-        assert.equal(h.claude.createRequests.length, created, 'no session before a reply');
-
         const newRoot = h.connector.messages.find((m) => m.activity.text === 'Separate topic: disk usage is growing.');
         assert.ok(newRoot);
+        assert.equal(handover.conversation_id, newRoot.id, 'the conversation ID is the root message ID');
+        assert.match(handover.url, /^https:\/\/teams\.microsoft\.com\/l\/message\//);
+        assert.equal(h.claude.createRequests.length, created, 'no session before a reply');
+        const entry = await h.instances[0]?.sb.conversations.get(CHANNEL, newRoot.id);
+        assert.equal(entry?.title, 'Disk usage on /data');
+        assert.equal(entry?.tags, '["disk"]');
+
         await h.post(h.message('What do you suggest?', { rootId: newRoot.id }));
         await eventually(() => h.claude.createRequests.length === created + 1);
         const first = h.firstText();
@@ -137,8 +142,13 @@ describe('tools and cards', () => {
             first,
             new RegExp(`^\\[switchboard:conversation-start\\] from_session=${callerSession} posted_at=`)
         );
-        assert.ok(first.includes('Separate topic: disk usage is growing.'));
-        assert.ok(first.includes('--- briefing ---\nVolume /data grew 20 % in a day.'));
+        assert.match(
+            first,
+            new RegExp(
+                `opening post by agent \\(session ${callerSession}\\):\\n {4}Separate topic: disk usage is growing\\.`
+            )
+        );
+        assert.ok(first.includes('    [briefing, not shown in Teams] Volume /data grew 20 % in a day.'));
         assert.match(first, /\[teams\] from="Jane Doe".*\nWhat do you suggest\?$/);
         const newSession = latestSession(h);
         await h.post(h.message('Thanks', { rootId: newRoot.id }));
@@ -146,7 +156,7 @@ describe('tools and cards', () => {
         assert.ok(!h.claude.userMessages(callerSession).some((m) => m.endsWith('Thanks')));
     });
 
-    it('closes cards when the session ends and continues with the log in a new session', async () => {
+    it('closes cards when the session ends and continues with the thread in a new session', async () => {
         const root = h.message('show a card');
         await h.post(root);
         await eventually(() => h.thread(root.id).includes('Waiting for your decision.'));
@@ -176,18 +186,19 @@ describe('tools and cards', () => {
             new RegExp(`^\\[switchboard:continuation\\] previous_session=${sessionId} reason=terminated at=`)
         );
         assert.match(request.title, / · #2$/);
-        // the log fits inline: the messages, the card with its JSON, its closing and the session change
-        assert.ok(!first.includes(LOG_FILE_PATH));
-        assert.ok(first.includes(`card ${cardId} shown`));
-        assert.ok(first.includes('Restart the worker?'));
-        assert.ok(first.includes(`card ${cardId} closed`));
-        assert.ok(first.includes(`session ${sessionId} ended (terminated)`));
+        // the thread as Teams shows it, annotated: the card as it shows now, its state and the session change
+        assert.ok(!first.includes(HISTORY_FILE_PATH));
+        assert.match(first, new RegExp(`card by agent \\(session ${sessionId}\\):\\n {4}Restart the worker\\?`));
+        assert.ok(first.includes('Closed – the session ended'));
+        assert.ok(first.includes(`[card ${cardId}: closed]`));
+        assert.ok(first.includes(`session ${sessionId} ended: terminated`));
+        assert.ok(first.includes(`note from Switchboard:\n    ${neutralise(endNotice('terminated'))}`));
         assert.match(first, /\[teams\] from="Jane Doe".*\nAre you still there\?$/);
-        const log = first.split('\n').slice(1, -2).join('\n');
-        assert.ok(!/^\[(teams|switchboard)/m.test(log), 'no header lines inside the log');
+        const history = first.split('\n').slice(1, -2).join('\n');
+        assert.ok(!/^\[(teams|switchboard)/m.test(history), 'no header lines inside the history');
     });
 
-    it('mounts a long log as a file and puts the latest entries into the message', async () => {
+    it('mounts a long history as a file and puts the latest entries into the message', async () => {
         const root = h.message(`Long report:\n${'line of the report\n'.repeat(150)}`);
         await h.post(root);
         await eventually(() => h.thread(root.id).some((t) => t.startsWith('Echo:')));
@@ -199,13 +210,13 @@ describe('tools and cards', () => {
         await eventually(() => h.claude.createRequests.length === created + 1);
         const request = h.request();
         const first = h.firstText();
-        assert.ok(first.includes(`The full history`) && first.includes(LOG_FILE_PATH));
+        assert.ok(first.includes(`The full history`) && first.includes(HISTORY_FILE_PATH));
         const files = (request.resources ?? []).filter((r) => r.type === 'file');
         assert.deepEqual(
             files.map((r) => r.mount_path),
-            [LOG_FILE_PATH]
+            [HISTORY_FILE_PATH]
         );
-        assert.ok(h.claude.files.has(files[0]?.file_id ?? ''), 'log uploaded');
+        assert.ok(h.claude.files.has(files[0]?.file_id ?? ''), 'history uploaded');
         assert.equal(CHANNEL.length > 0, true);
     });
 });

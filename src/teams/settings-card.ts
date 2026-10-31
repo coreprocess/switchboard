@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { DeploymentInfo } from '../claude/templates.ts';
-import type { CardJson } from '../core/gateway.ts';
+import type { CardJson } from '../core/platform.ts';
 import { clip } from '../core/text.ts';
 import type { Binding, Job } from '../store/entities.ts';
 
@@ -34,7 +34,6 @@ export interface SettingsView {
     job?: Job;
     options: DeploymentInfo[];
     defaultTimezone: string;
-    defaultMaxRuntimeMin: number;
     /** Result of the last action: saved, or what was wrong. */
     status?: string;
     problems?: string[];
@@ -105,13 +104,6 @@ export const renderSettingsCard = (view: SettingsView): CardJson => {
                 label: 'Time zone',
                 value: job?.timezone ?? view.defaultTimezone,
             },
-            {
-                type: 'Input.Number',
-                id: 'job_max_runtime',
-                label: 'Maximum run time (minutes)',
-                min: 1,
-                value: job?.maxRuntimeMin ?? view.defaultMaxRuntimeMin,
-            },
             ...(view.problems?.length
                 ? [
                       {
@@ -143,6 +135,5 @@ export const SettingsInput = z.looseObject({
     job_enabled: z.string().optional(),
     job_cron: z.string().optional(),
     job_timezone: z.string().optional(),
-    job_max_runtime: z.union([z.string(), z.number()]).optional(),
 });
 export type SettingsInput = z.infer<typeof SettingsInput>;

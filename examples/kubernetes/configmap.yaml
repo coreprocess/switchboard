@@ -14,4 +14,6 @@ data:
   SWITCHBOARD_TABLE_PREFIX: switchboard
   STORE_TABLES_ENDPOINT: https://<storage account>.table.core.windows.net
   DEFAULT_TIMEZONE: Europe/Berlin
+  # Safety limit for job runs that got stuck; the deployments' budgets limit cost and work
+  JOB_MAX_RUNTIME_HOURS: "24"
   LOG_LEVEL: info

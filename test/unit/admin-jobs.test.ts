@@ -16,7 +16,7 @@ describe('admins, settings and jobs', () => {
     const releaseTurn = () => gate.release?.();
 
     before(async () => {
-        h = await startHarness({ now: () => new Date(Date.now() + offset) });
+        h = await startHarness({ now: () => new Date(Date.now() + offset), env: { JOB_MAX_RUNTIME_HOURS: '1' } });
         h.claude.agent = async (turn: Turn) => {
             if (turn.text.includes('Run the hourly check.')) {
                 if (turn.text.includes('hold')) return;
@@ -63,6 +63,7 @@ describe('admins, settings and jobs', () => {
         const card = JSON.stringify(h.connector.messages.at(-1)?.activity);
         assert.ok(card.includes(`${WORKSPACE}|depl_conversation`));
         assert.ok(card.includes('ops-hourly-check · Test · depl_job · Ops Agent v1'));
+        assert.ok(!/run time|runtime/i.test(card), 'no run-time field: the limit is the instance’s');
     });
 
     it('rejects a deployment with a schedule and a clashing tool', async () => {
@@ -90,7 +91,7 @@ describe('admins, settings and jobs', () => {
         await eventually(() => latestText(h).startsWith('**Switchboard in ops**'));
         const status = latestText(h);
         assert.match(status, /Conversation deployment: ops-conversation · Test · depl_conversation · Ops Agent v1/);
-        assert.match(status, /Job: `7 \* \* \* \*` \(Europe\/Berlin\), on, at most 60 min; last run: none; next run: /);
+        assert.match(status, /Job: `7 \* \* \* \*` \(Europe\/Berlin\), on; last run: none; next run: /);
     });
 
     it('shows a hint when the agent has a newer version than the deployment uses', async () => {
@@ -135,7 +136,7 @@ describe('admins, settings and jobs', () => {
         assert.equal(runs.find((r) => r.status === 'succeeded')?.finalMessage, 'All deployments are fine.');
     });
 
-    it('stops a run over its maximum run time and moves it into a thread', async () => {
+    it('stops a stuck run, moves it into a thread and lets the next run start', async () => {
         const sb = h.instances[0]?.sb;
         assert.ok(sb);
         gate.release = undefined;
@@ -143,15 +144,29 @@ describe('admins, settings and jobs', () => {
         await eventually(() => latestText(h).startsWith('▶️ Job run started'));
         const jobSessionId = /session `([^`]+)`/.exec(latestText(h))?.[1] ?? '';
         await eventually(() => gate.release !== undefined);
+        await command(h, 'status');
+        await eventually(() => /last run: running since /.test(latestText(h)), 8000, 'running run in status');
         offset = 2 * 60 * 60 * 1000;
         await sb.jobs.tick();
         await eventually(() =>
-            h.claude.userMessages(jobSessionId).some((m) => m.startsWith('[switchboard:job-failed] reason=timeout'))
+            h.claude.userMessages(jobSessionId).some((m) => m.startsWith('[switchboard:job-failed] reason=stuck'))
         );
         const entry = await sb.sessions.get(jobSessionId);
         assert.ok(entry?.rootId, 'the job session owns a thread now');
         const note = h.connector.created.at(-1) as { activity: { text: string } };
-        assert.match(note.activity.text, /A job run failed.*ran longer than its maximum run time.*Session `/);
+        assert.match(note.activity.text, /A job run failed.*got stuck.*Session `/);
+        const job = (await sb.entities.jobs.list({ partitionKey: CHANNEL }))[0]?.value;
+        assert.ok(job);
+        assert.equal(job.activeRun, undefined, 'the job is free again');
+        const stuck = (await sb.entities.jobRuns.list({ partitionKey: job.jobId })).find(
+            (run) => run.value.reason === 'stuck'
+        );
+        assert.equal(stuck?.value.status, 'failed');
+        releaseTurn();
+        gate.release = undefined;
+        await command(h, 'run', true);
+        await eventually(() => latestText(h).startsWith('▶️ Job run started'), 8000, 'next run');
+        await eventually(() => gate.release !== undefined);
         offset = 0;
         releaseTurn();
     });

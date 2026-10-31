@@ -1,67 +1,60 @@
-import { randomBytes, randomUUID } from 'node:crypto';
-import { APIError } from '@anthropic-ai/sdk';
-import { type IncomingAttachment, imageBlocks } from '../attachments/attachments.ts';
-import type { ContentBlock, FileResource } from '../claude/templates.ts';
-import {
-    clip,
-    continuationHeader,
-    conversationStartHeader,
-    formatHumanMessage,
-    neutralise,
-    type Person,
-} from '../core/text.ts';
-import { sleep, timeOfMessageId } from '../core/time.ts';
-import type { Binding, Conversation, LogEntry, SessionEntry } from '../store/entities.ts';
+import { cardText } from '../cards/cards.ts';
+import type { ChannelRef, OutboundContent, ThreadMessage } from '../core/platform.ts';
+import { clip } from '../core/text.ts';
+import type { Binding, Conversation, PostedKind, Versioned } from '../store/entities.ts';
 import type { Switchboard } from '../switchboard.ts';
-import {
-    type AttachmentRef,
-    formatEntries,
-    formatHistory,
-    type HistoryMessage,
-    LOG_FILE_PATH,
-    type LogItem,
-    placeLog,
-} from './log.ts';
 
 /**
- * Conversations (concept: "Messages from Teams", "Session end and continuation"): one thread, at most one owning
- * session, and the log that lets a new session continue the thread. The owning session is created only under a
- * claim on the conversation entry, so concurrent messages on several pods never create two sessions.
+ * Conversations are Teams threads; this is Switchboard's augmentation of them: which session owns a thread, its
+ * description, its briefing, and which session posted which message. An entry is created the first time a thread
+ * matters. Every message Switchboard posts goes through here, so it is attributed and counts as activity.
  */
 
-/** Reads a thread's history from the platform when Switchboard has no log for it. */
-export interface HistoryReader {
-    read(binding: Binding, rootId: string, max: number): Promise<{ messages: HistoryMessage[]; truncated: boolean }>;
-}
-
-export interface HumanMessage {
-    binding: Binding;
-    rootId: string;
-    messageId: string;
-    /** The thread's opening post (a new thread). */
-    isRoot: boolean;
-    from: Person;
-    at: Date;
-    text: string;
-    attachments: IncomingAttachment[];
+export interface Description {
+    title?: string | undefined;
+    summary?: string | undefined;
+    tags?: string[] | undefined;
 }
 
 export interface NewThread {
     binding: Binding;
     text: string;
     origin: Conversation['origin'];
+    /** The session the new thread belongs to from the start (`convert_to_conversation`, job failures). */
     owningSession?: string;
-    briefing?: string;
+    /** The session that opened the thread (`start_new_conversation`, `convert_to_conversation`); else Switchboard. */
     originSession?: string;
+    briefing?: string;
+    description?: Description;
 }
 
-/** Images of the latest messages in a continuation; older ones appear as lines. */
-const CONTINUATION_IMAGE_MESSAGES = 10;
-const HISTORY_MAX_MESSAGES = 500;
+export interface PostOptions {
+    kind: PostedKind;
+    sessionId?: string;
+}
 
-export const newConversationId = () => `cnv_${randomBytes(12).toString('base64url')}`;
+export const channelOf = (entity: { teamId: string; channelId: string }): ChannelRef => ({
+    teamId: entity.teamId,
+    channelId: entity.channelId,
+});
 
-const entryKey = (at: Date) => `${at.toISOString()}-${randomBytes(4).toString('hex')}`;
+export const parseTags = (tags: string | undefined): string[] => {
+    if (!tags) return [];
+    try {
+        const parsed: unknown = JSON.parse(tags);
+        return Array.isArray(parsed) ? parsed.filter((tag): tag is string => typeof tag === 'string') : [];
+    } catch {
+        return [];
+    }
+};
+
+/** The title people and agents see: the description's, else the post's subject, else its first line. */
+export const titleOf = (conversation: Conversation | undefined, root: ThreadMessage | undefined): string => {
+    if (conversation?.title) return conversation.title;
+    if (root?.subject) return root.subject;
+    const line = root?.text.split('\n').find((l) => l.trim().length > 0) ?? '';
+    return clip(line.trim(), 100) || 'untitled';
+};
 
 export class Conversations {
     readonly #sb: Switchboard;
@@ -74,36 +67,43 @@ export class Conversations {
         return (await this.#sb.entities.conversations.get(channelId, rootId))?.value;
     }
 
-    /**
-     * Appends to the conversation's log. People's messages and clicks and the agent's answers, updates and card
-     * changes count as activity (archive and retention count from it); Switchboard's own bookkeeping does not.
-     */
-    async record(channelId: string, rootId: string, item: LogItem) {
+    /** The thread's entry, created when the thread matters for the first time. */
+    async ensure(binding: Binding, rootId: string): Promise<Versioned<Conversation>> {
         const sb = this.#sb;
-        const now = sb.now();
-        const activity =
-            ['human', 'agent', 'opening', 'card-click', 'confirmation'].includes(item.kind) ||
-            (item.kind === 'card' && item.event !== 'closed');
-        const conversation = activity
-            ? (
-                  await sb.entities.conversations.modify(channelId, rootId, (current) => ({
-                      ...current,
-                      lastActivity: now.toISOString(),
-                  }))
-              )?.value
-            : await this.get(channelId, rootId);
-        if (!conversation) return;
-        await sb.entities.logs.upsert({
-            conversationId: conversation.conversationId,
-            entryKey: entryKey(now),
-            at: now.toISOString(),
-            item: JSON.stringify(item),
+        const existing = await sb.entities.conversations.get(binding.channelId, rootId);
+        if (existing) return existing;
+        const now = sb.now().toISOString();
+        const inserted = await sb.entities.conversations.insert({
+            channelId: binding.channelId,
+            rootId,
+            teamId: binding.teamId,
+            origin: 'thread',
+            sessionCount: 0,
+            createdAt: now,
+            lastActivity: now,
         });
+        if (inserted) return inserted;
+        const raced = await sb.entities.conversations.get(binding.channelId, rootId);
+        if (!raced) throw new Error(`conversation ${rootId} vanished while it was created`);
+        return raced;
     }
 
-    async entries(conversationId: string): Promise<LogEntry[]> {
-        const rows = await this.#sb.entities.logs.list({ partitionKey: conversationId });
-        return rows.map((row) => row.value).sort((a, b) => a.entryKey.localeCompare(b.entryKey));
+    /** Something happened in the conversation that counts as activity (archive and retention count from it). */
+    async touch(channelId: string, rootId: string) {
+        const now = this.#sb.now().toISOString();
+        await this.#sb.entities.conversations.modify(channelId, rootId, (current) =>
+            current.lastActivity >= now ? undefined : { ...current, lastActivity: now }
+        );
+    }
+
+    async describe(channelId: string, rootId: string, description: Description): Promise<Conversation | undefined> {
+        const written = await this.#sb.entities.conversations.modify(channelId, rootId, (current) => ({
+            ...current,
+            ...(description.title !== undefined ? { title: clip(description.title, 200) } : {}),
+            ...(description.summary !== undefined ? { summary: clip(description.summary, 2_000) } : {}),
+            ...(description.tags !== undefined ? { tags: JSON.stringify(description.tags) } : {}),
+        }));
+        return written?.value;
     }
 
     /** The session leaves the thread (if it still owns it). */
@@ -115,326 +115,104 @@ export class Conversations {
         );
     }
 
-    /** Posts a new thread in the binding's channel and records it as a conversation. */
-    async createThread(thread: NewThread): Promise<{ conversation: Conversation; url: string }> {
+    /**
+     * Posts a new message into a thread for a session or for Switchboard itself: attributed, counted as activity
+     * (except Switchboard's notes), and seen by sessions waiting for a message in this conversation.
+     */
+    async post(channel: ChannelRef, rootId: string, content: OutboundContent, options: PostOptions) {
+        const { messageId } = await this.#sb.platform.reply(channel, rootId, content);
+        await this.#arrived(channel, rootId, messageId, content, options);
+        return { messageId };
+    }
+
+    /** Turns a message Switchboard showed before (the "working…" message) into a new message, like `post`. */
+    async publish(
+        channel: ChannelRef,
+        rootId: string,
+        messageId: string,
+        content: OutboundContent,
+        options: PostOptions
+    ) {
+        await this.#sb.platform.update(channel, rootId, messageId, content);
+        await this.#arrived(channel, rootId, messageId, content, options);
+    }
+
+    /** Changes one of Switchboard's messages in place (cards); `activity` when it counts as activity. */
+    async edit(
+        channel: ChannelRef,
+        rootId: string,
+        messageId: string,
+        content: OutboundContent,
+        options: PostOptions & { activity: boolean }
+    ) {
+        await this.#sb.platform.update(channel, rootId, messageId, content);
+        await this.#record(channel, rootId, messageId, options);
+        if (options.activity) await this.touch(channel.channelId, rootId);
+    }
+
+    async #arrived(
+        channel: ChannelRef,
+        rootId: string,
+        messageId: string,
+        content: OutboundContent,
+        options: PostOptions
+    ) {
+        const sb = this.#sb;
+        await this.#record(channel, rootId, messageId, options);
+        if (options.kind !== 'note') await this.touch(channel.channelId, rootId);
+        await sb.waits.conversationMessage(channel.channelId, rootId, {
+            from: options.sessionId ? `agent (session ${options.sessionId})` : 'Switchboard',
+            at: sb.now().toISOString(),
+            text: content.text ?? cardText(content.card),
+        });
+    }
+
+    async #record(channel: ChannelRef, rootId: string, messageId: string, options: PostOptions) {
+        await this.#sb.entities.posted.upsert({
+            channelId: channel.channelId,
+            messageId,
+            rootId,
+            kind: options.kind,
+            sessionId: options.sessionId,
+            at: this.#sb.now().toISOString(),
+        });
+    }
+
+    /** Opens a new thread in the binding's channel and records it as a conversation. */
+    async open(thread: NewThread): Promise<{ conversation: Conversation; url: string }> {
         const sb = this.#sb;
         const { binding } = thread;
-        const channel = { teamId: binding.teamId, channelId: binding.channelId };
-        const { rootId, url } = await sb.gateway.postThread(channel, { text: thread.text });
+        const channel = channelOf(binding);
+        const { rootId, url } = await sb.platform.postThread(channel, { text: thread.text });
+        await this.#record(channel, rootId, rootId, {
+            kind: 'opening',
+            ...(thread.originSession ? { sessionId: thread.originSession } : {}),
+        });
         const now = sb.now().toISOString();
+        const tags = thread.description?.tags;
         const conversation: Conversation = {
             channelId: binding.channelId,
             rootId,
-            conversationId: newConversationId(),
             teamId: binding.teamId,
-            workspaceId: binding.workspaceId,
             origin: thread.origin,
             owningSession: thread.owningSession,
             sessionCount: thread.owningSession ? 1 : 0,
-            openingText: thread.origin === 'start_new_conversation' ? thread.text : undefined,
+            title: thread.description?.title,
+            summary: thread.description?.summary,
+            tags: tags ? JSON.stringify(tags) : undefined,
             briefing: thread.briefing,
             originSession: thread.originSession,
             createdAt: now,
             lastActivity: now,
         };
         await sb.entities.conversations.upsert(conversation);
-        await this.record(binding.channelId, rootId, {
-            kind: 'opening',
-            ...(thread.originSession ? { session: thread.originSession } : {}),
-            text: thread.text,
-        });
-        if (thread.owningSession) {
-            await this.record(binding.channelId, rootId, {
-                kind: 'session',
-                event: 'attached',
-                session: thread.owningSession,
-            });
-        }
         return { conversation, url };
     }
 
-    /** A message from a person in a bound channel: a new thread, or a reply to a known or unknown thread. */
-    async onHuman(message: HumanMessage) {
-        const sb = this.#sb;
-        const { binding, rootId } = message;
-        let fresh: 'root' | 'unknown' | undefined;
-        if (!(await this.get(binding.channelId, rootId))) {
-            const now = sb.now().toISOString();
-            const inserted = await sb.entities.conversations.insert({
-                channelId: binding.channelId,
-                rootId,
-                conversationId: newConversationId(),
-                teamId: binding.teamId,
-                workspaceId: binding.workspaceId,
-                origin: 'human',
-                sessionCount: 0,
-                // a reply in a thread Switchboard has not seen: its first session reads the thread from Teams
-                ...(message.isRoot ? {} : { historyFromTeams: true }),
-                createdAt: now,
-                lastActivity: now,
-            });
-            if (inserted) fresh = message.isRoot ? 'root' : 'unknown';
-        }
-        const conversation = await this.get(binding.channelId, rootId);
-        if (!conversation) return;
-        const attachments = await sb.attachments.prepare(
-            binding.workspaceId,
-            conversation.conversationId,
-            message.messageId,
-            message.attachments
-        );
-        await this.record(binding.channelId, rootId, {
-            kind: 'human',
-            name: message.from.name ?? 'unknown',
-            aad: message.from.aadObjectId,
-            text: message.text,
-            attachments: [...attachments.refs, ...attachments.rejected],
+    /** A notice from Switchboard to the whole channel, as a thread of its own (a reply there reaches an agent). */
+    async notice(binding: Binding, text: string) {
+        await this.open({ binding, text, origin: 'notice' }).catch((error: unknown) => {
+            this.#sb.log.warn({ err: error, channelId: binding.channelId }, 'notice not posted');
         });
-        if (attachments.rejected.length > 0) {
-            const names = attachments.rejected.map((a) => `${a.name} (${a.unsupported})`).join(', ');
-            await sb.gateway
-                .reply({ teamId: binding.teamId, channelId: binding.channelId }, rootId, {
-                    text: `ℹ️ Not passed to the agent: ${clip(names, 500)}. Only images are supported so far.`,
-                })
-                .catch(() => undefined);
-        }
-        const rejectedLines = attachments.rejected.map(
-            (a) => `[attachment not supported] name=${a.name} type=${a.mediaType}`
-        );
-        const text = [message.text, ...rejectedLines].filter(Boolean).join('\n');
-        const human = formatHumanMessage(message.from, message.at, text);
-        await this.#deliver(binding, rootId, { human, images: attachments.blocks, fresh });
-    }
-
-    /**
-     * Gets a message to the thread's owning session, creating one (under a claim) when there is none. The first
-     * message of a new session depends on how the thread came about (concept: "Message formats").
-     */
-    async #deliver(
-        binding: Binding,
-        rootId: string,
-        message: { human: string; images: ContentBlock[]; fresh: 'root' | 'unknown' | undefined }
-    ) {
-        const sb = this.#sb;
-        const deadline = Date.now() + sb.timing.claimWaitMs;
-        // one claim per delivery, not per pod: two messages of a thread on the same pod must not both create a session
-        const claim = `${sb.podId}:${randomUUID()}`;
-        for (;;) {
-            const current = await sb.entities.conversations.get(binding.channelId, rootId);
-            if (!current) return;
-            const conversation = current.value;
-            if (conversation.owningSession) {
-                const owner = await sb.sessions.get(conversation.owningSession);
-                if (owner?.state === 'active' && (await this.#sendTo(owner, message))) return;
-                await this.detach(binding.channelId, rootId, conversation.owningSession, owner?.endReason ?? 'ended');
-                continue;
-            }
-            const now = sb.now();
-            const claimedByOther =
-                conversation.claimedBy &&
-                conversation.claimedBy !== claim &&
-                (conversation.claimedUntil ?? '') > now.toISOString();
-            if (claimedByOther) {
-                if (Date.now() > deadline) {
-                    await this.#note(
-                        binding,
-                        rootId,
-                        '⚠️ Your message could not be passed on yet; please send it again.'
-                    );
-                    return;
-                }
-                await sleep(500);
-                continue;
-            }
-            const claimed = await sb.entities.conversations.update(current, {
-                ...conversation,
-                claimedBy: claim,
-                claimedUntil: new Date(now.getTime() + sb.timing.claimMs).toISOString(),
-            });
-            if (!claimed) continue;
-            // the claim expired while the session was created and another delivery won: send it there instead
-            if (await this.#startSession(binding, claimed.value, claim, message)) return;
-        }
-    }
-
-    /** Sends to an active owner; `false` when the session turned out to have ended (then a new one starts). */
-    async #sendTo(owner: SessionEntry, message: { human: string; images: ContentBlock[] }): Promise<boolean> {
-        const sb = this.#sb;
-        try {
-            await sb.sessions.send(owner, [{ type: 'text', text: message.human }, ...message.images]);
-            return true;
-        } catch (error) {
-            if (!(error instanceof APIError) || error.status >= 500) throw error;
-            const session = await sb.workspaces
-                .get(owner.workspaceId)
-                .retrieveSession(owner.sessionId)
-                .catch(() => undefined);
-            if (session && session.status !== 'terminated' && session.archived_at === null) throw error;
-            await sb.sessions.end(owner.sessionId, session?.archived_at ? 'archived' : 'terminated');
-            return false;
-        }
-    }
-
-    async #startSession(
-        binding: Binding,
-        conversation: Conversation,
-        claim: string,
-        message: { human: string; images: ContentBlock[]; fresh: 'root' | 'unknown' | undefined }
-    ): Promise<boolean> {
-        const sb = this.#sb;
-        const { channelId, rootId } = conversation;
-        try {
-            const first = await this.#firstMessage(binding, conversation, message);
-            const entry = await sb.sessions.create({
-                binding,
-                kind: 'conversation',
-                deploymentId: binding.conversationDeploymentId,
-                rootId,
-                conversationId: conversation.conversationId,
-                seq: conversation.sessionCount + 1,
-                titleTime: timeOfMessageId(rootId) ?? new Date(conversation.createdAt),
-                firstContent: first.content,
-                ...(first.files.length > 0 ? { files: first.files } : {}),
-            });
-            let attached = false;
-            await sb.entities.conversations.modify(channelId, rootId, (current) => {
-                // only while this delivery's claim holds and nobody else attached a session meanwhile
-                attached = current.claimedBy === claim && !current.owningSession;
-                return attached
-                    ? {
-                          ...current,
-                          owningSession: entry.sessionId,
-                          sessionCount: current.sessionCount + 1,
-                          claimedBy: undefined,
-                          claimedUntil: undefined,
-                          historyFromTeams: undefined,
-                      }
-                    : undefined;
-            });
-            if (!attached) {
-                sb.log.warn({ sessionId: entry.sessionId, channelId }, 'claim lost while creating a session');
-                // the extra session leaves the thread at once (nothing of it is posted) and is archived when idle
-                const detached = await sb.sessions.modify(entry.sessionId, (current) => ({
-                    ...current,
-                    rootId: undefined,
-                }));
-                await sb.sessions.archive(detached?.value ?? entry, 'claim_lost').catch(() => false);
-                return false;
-            }
-            await this.record(channelId, rootId, { kind: 'session', event: 'attached', session: entry.sessionId });
-        } catch (error) {
-            sb.log.warn({ err: error, channelId, rootId }, 'conversation session not created');
-            await sb.entities.conversations.modify(channelId, rootId, (current) =>
-                current.claimedBy === claim ? { ...current, claimedBy: undefined, claimedUntil: undefined } : undefined
-            );
-            const reason = error instanceof Error ? clip(error.message, 300) : 'unknown error';
-            await this.#note(
-                binding,
-                rootId,
-                `⚠️ Could not start an agent session: ${reason}. Send another message to try again.`
-            );
-        }
-        return true;
-    }
-
-    async #note(binding: Binding, rootId: string, text: string) {
-        await this.#sb.gateway
-            .reply({ teamId: binding.teamId, channelId: binding.channelId }, rootId, { text })
-            .catch(() => undefined);
-    }
-
-    /** Switchboard's part of a new session's first message, and files to mount. */
-    async #firstMessage(
-        binding: Binding,
-        conversation: Conversation,
-        message: { human: string; images: ContentBlock[]; fresh: 'root' | 'unknown' | undefined }
-    ): Promise<{ content: ContentBlock[]; files: FileResource[] }> {
-        const sb = this.#sb;
-        const now = sb.now();
-        const text = (value: string): ContentBlock => ({ type: 'text', text: value });
-        if (conversation.sessionCount === 0 && message.fresh === 'root') {
-            return { content: [text(message.human), ...message.images], files: [] };
-        }
-        if (conversation.sessionCount === 0 && conversation.origin === 'start_new_conversation') {
-            const parts = [
-                conversationStartHeader(conversation.originSession ?? 'none', new Date(conversation.createdAt)),
-                neutralise(conversation.openingText ?? ''),
-                ...(conversation.briefing ? ['--- briefing ---', neutralise(conversation.briefing)] : []),
-                message.human,
-            ];
-            return { content: [text(parts.join('\n')), ...message.images], files: [] };
-        }
-        const fromTeams =
-            message.fresh === 'unknown' || (conversation.sessionCount === 0 && conversation.historyFromTeams);
-        const entries = fromTeams ? [] : await this.entries(conversation.conversationId);
-        // the latest entry is the message being delivered: it follows the history with its own header
-        const history = entries.slice(0, -1);
-        let lines: string[];
-        let note: string | undefined;
-        let header: string;
-        let images: ContentBlock[] = [];
-        if (history.length > 0) {
-            lines = formatEntries(history);
-            header = continuationHeader(
-                conversation.previousSession ?? 'none',
-                conversation.previousReason ?? 'ended',
-                now
-            );
-            const recentHuman = history
-                .map((entry) => JSON.parse(entry.item) as LogItem)
-                .filter((item): item is Extract<LogItem, { kind: 'human' }> => item.kind === 'human')
-                .slice(-CONTINUATION_IMAGE_MESSAGES);
-            images = imageBlocks(recentHuman.flatMap((item) => item.attachments ?? []));
-        } else {
-            header = continuationHeader('none', 'history_from_teams', now);
-            ({ lines, note } = await this.#history(binding, conversation));
-        }
-        const placed = placeLog(lines, sb.settings.logInlineLimitBytes, note);
-        const files: FileResource[] = [];
-        if (!placed.inline) {
-            const api = sb.workspaces.get(binding.workspaceId);
-            const fileId = await api.uploadFile('conversation-log.md', 'text/markdown', Buffer.from(placed.file));
-            await sb.entities.files.upsert({
-                owner: conversation.conversationId,
-                fileId,
-                workspaceId: binding.workspaceId,
-                kind: 'log',
-                mediaType: 'text/markdown',
-                name: 'conversation-log.md',
-                size: Buffer.byteLength(placed.file),
-                createdAt: now.toISOString(),
-            });
-            files.push({ type: 'file', file_id: fileId, mount_path: LOG_FILE_PATH });
-        }
-        return {
-            content: [text([header, placed.text, message.human].join('\n')), ...images, ...message.images],
-            files,
-        };
-    }
-
-    /** The thread's history read from the platform, for threads Switchboard has no log of. */
-    async #history(binding: Binding, conversation: Conversation): Promise<{ lines: string[]; note?: string }> {
-        const sb = this.#sb;
-        try {
-            const { messages, truncated } = await sb.history.read(binding, conversation.rootId, HISTORY_MAX_MESSAGES);
-            // the newest message is the one being delivered; it follows with its own header
-            const earlier = messages.slice(0, -1);
-            return {
-                lines: formatHistory(earlier),
-                ...(truncated
-                    ? { note: `Only the latest ${HISTORY_MAX_MESSAGES} messages of the thread were read.` }
-                    : {}),
-            };
-        } catch (error) {
-            sb.log.warn({ err: error, channelId: binding.channelId }, 'thread history not read');
-            await this.#note(
-                binding,
-                conversation.rootId,
-                'ℹ️ The earlier messages of this thread could not be read; the agent starts without them.'
-            );
-            return { lines: [], note: 'The earlier messages of this thread could not be read.' };
-        }
     }
 }
-
-export type { AttachmentRef };

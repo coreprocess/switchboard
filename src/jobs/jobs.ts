@@ -10,7 +10,7 @@ const FINAL_MESSAGE_BYTES = 2048;
 
 /** Why a run failed, as people read it. */
 const FAILURE_REASONS: Record<string, string> = {
-    timeout: 'it ran longer than its maximum run time',
+    stuck: 'it got stuck: it ran longer than the run-time limit and was stopped',
     budget_reached: 'it reached its budget',
     terminated: 'its session was terminated',
     deleted: 'its session was deleted',
@@ -34,7 +34,8 @@ export const nextRun = (job: Pick<Job, 'cron' | 'timezone'>, after: Date): Date 
 /**
  * Jobs (concept: "Jobs"): every pod runs the timer; each tick is claimed by inserting its run entry, so exactly
  * one pod starts it. One run per job is active at a time (conditional write on the job's `activeRun`). Ticks
- * missed while no pod ran are not caught up.
+ * missed while no pod ran are not caught up. The deployment's budget limits a run's cost and work; the
+ * instance-wide `JOB_MAX_RUNTIME_HOURS` only frees a job whose run got stuck, so later ticks can start again.
  */
 export class Jobs {
     readonly #sb: Switchboard;
@@ -54,7 +55,7 @@ export class Jobs {
         if (this.#timer) clearInterval(this.#timer);
     }
 
-    /** Starts the runs of ticks since the last check, and stops runs over their maximum run time. */
+    /** Starts the runs of ticks since the last check, and stops runs that got stuck. */
     async tick() {
         const sb = this.#sb;
         const now = sb.now();
@@ -70,7 +71,7 @@ export class Jobs {
                     due = nextRun(job, due);
                 }
             }
-            await this.#timeouts(now);
+            await this.#stuck(now);
         } catch (error) {
             sb.log.warn({ err: error }, 'job tick failed');
         }
@@ -128,12 +129,10 @@ export class Jobs {
             sb.log.warn({ err: error, jobId: job.jobId, runKey }, 'job session not created');
             await this.#finish(job.channelId, job.jobId, runKey, 'failed', `session not created: ${reason}`);
             if (binding) {
-                await sb.gateway
-                    .postThread(
-                        { teamId: binding.teamId, channelId: binding.channelId },
-                        { text: `⚠️ A job run could not start (${formatLocal(sb.now(), job.timezone)}): ${reason}` }
-                    )
-                    .catch(() => undefined);
+                await sb.conversations.notice(
+                    binding,
+                    `⚠️ A job run could not start (${formatLocal(sb.now(), job.timezone)}): ${reason}`
+                );
             }
             return { ...run, status: 'failed', reason };
         }
@@ -172,8 +171,9 @@ export class Jobs {
         const sb = this.#sb;
         let finished = false;
         await sb.entities.jobRuns.modify(jobId, runKey, (current) => {
-            if (current.status !== 'running') return undefined;
-            finished = true;
+            // decided per attempt: after a conflict another pod may have finished the run meanwhile
+            finished = current.status === 'running';
+            if (!finished) return undefined;
             return {
                 ...current,
                 status,
@@ -239,7 +239,7 @@ export class Jobs {
         const run =
             entry.jobId && entry.runKey ? (await sb.entities.jobRuns.get(entry.jobId, entry.runKey))?.value : undefined;
         const note = this.#failureNote(binding, entry, run, reason);
-        const { conversation } = await sb.conversations.createThread({
+        const { conversation } = await sb.conversations.open({
             binding,
             text: note,
             origin: 'job_failure',
@@ -267,6 +267,15 @@ export class Jobs {
         return moved?.value;
     }
 
+    async #noteInThread(entry: SessionEntry, reason: string) {
+        const sb = this.#sb;
+        const binding = (await sb.entities.bindings.get(entry.teamId, entry.channelId))?.value;
+        if (!binding) return;
+        const run =
+            entry.jobId && entry.runKey ? (await sb.entities.jobRuns.get(entry.jobId, entry.runKey))?.value : undefined;
+        await sb.sessions.notice(entry, this.#failureNote(binding, entry, run, reason));
+    }
+
     #failureNote(binding: Binding, entry: SessionEntry, run: JobRun | undefined, reason: string) {
         const zone = this.#sb.settings.defaultTimezone;
         const started = run ? formatLocal(new Date(run.startedAt), zone) : 'unknown';
@@ -277,23 +286,28 @@ export class Jobs {
         );
     }
 
-    /** Runs over their maximum run time are interrupted and fail with `timeout`; the session moves to a thread. */
-    async #timeouts(now: Date) {
+    /**
+     * Runs longer than `JOB_MAX_RUNTIME_HOURS` got stuck: the session is interrupted, the run fails with `stuck`
+     * and is handled like any failed run (failure note; the session moves into a thread if it can still take
+     * messages). The job is free for its next tick.
+     */
+    async #stuck(now: Date) {
         const sb = this.#sb;
+        const limitMs = sb.settings.jobMaxRuntimeHours * 60 * 60 * 1000;
         const running = await sb.entities.jobRuns.list({ where: [{ field: 'status', op: 'eq', value: 'running' }] });
         for (const { value: run } of running) {
-            const job = (await sb.entities.jobs.get(run.channelId, run.jobId))?.value;
-            const maxMs = (job?.maxRuntimeMin ?? sb.settings.defaultJobMaxRuntimeMin) * 60_000;
-            if (Date.parse(run.startedAt) + maxMs > now.getTime()) continue;
-            if (!(await this.#finish(run.channelId, run.jobId, run.runKey, 'failed', 'timeout'))) continue;
+            if (Date.parse(run.startedAt) + limitMs > now.getTime()) continue;
+            if (!(await this.#finish(run.channelId, run.jobId, run.runKey, 'failed', 'stuck'))) continue;
             const entry = run.sessionId ? await sb.sessions.get(run.sessionId) : undefined;
+            sb.log.warn({ sessionId: run.sessionId, jobId: run.jobId }, 'job run stuck');
             if (!entry) continue;
-            sb.log.info({ sessionId: entry.sessionId, jobId: run.jobId }, 'job run timed out');
-            if (entry.state === 'active') await sb.sessions.interrupt(entry, 'timeout');
-            await this.moveToThread(entry, 'timeout', entry.state === 'active');
+            if (entry.state === 'active') await sb.sessions.interrupt(entry, 'stuck');
+            // a session in a thread already (it waits for a confirmation) gets the failure note there
+            if (entry.rootId) await this.#noteInThread(entry, 'stuck');
+            else await this.moveToThread(entry, 'stuck', entry.state === 'active');
             // it is a conversation now; a later end gets its notice as usual
             await sb.sessions.modify(entry.sessionId, (current) =>
-                current.stopping === 'timeout' ? { ...current, stopping: undefined } : undefined
+                current.stopping === 'stuck' ? { ...current, stopping: undefined } : undefined
             );
         }
     }

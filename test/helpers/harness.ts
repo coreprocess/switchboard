@@ -5,8 +5,6 @@ import { z } from 'zod';
 import { createApp } from '../../src/app.ts';
 import { ClaudeWorkspaces, createClaudeApi } from '../../src/claude/api.ts';
 import { loadSettings, type Settings } from '../../src/config/env.ts';
-import type { HistoryReader } from '../../src/conversations/conversations.ts';
-import type { HistoryMessage } from '../../src/conversations/log.ts';
 import { createLogger, nullLogger } from '../../src/core/logger.ts';
 import { listen } from '../../src/server/http.ts';
 import { MemoryStore } from '../../src/store/memory.ts';
@@ -34,6 +32,7 @@ export const FAST: Partial<Timing> = {
     schedulerMs: 150,
     claimMs: 4_000,
     claimWaitMs: 8_000,
+    waitTickMs: 100,
 };
 
 /** Polls until `check` holds (or fails after `timeoutMs`). */
@@ -83,7 +82,6 @@ export interface HarnessOptions {
     instances?: number;
     store?: Store;
     env?: Record<string, string>;
-    history?: HistoryMessage[];
     /** Start the background loops (reconciler, scheduler). */
     loops?: boolean;
     timing?: Partial<Timing>;
@@ -97,6 +95,7 @@ export const startHarness = async (options: HarnessOptions = {}) => {
     const connector = new MockConnector();
     await claude.start();
     await connector.start();
+    if (options.now) connector.now = options.now;
     connector.teams.set(TEAM, {
         name: 'Dev Agents',
         aadGroupId: TEAM_GROUP,
@@ -130,12 +129,6 @@ export const startHarness = async (options: HarnessOptions = {}) => {
     };
     const settings: Settings = loadSettings(env);
     const store = options.store ?? new MemoryStore();
-    const history: HistoryReader = {
-        read: async () => {
-            if (!options.history) throw new Error('no history');
-            return { messages: options.history, truncated: false };
-        },
-    };
     const log = process.env.TEST_LOG ? createLogger(process.env.TEST_LOG) : nullLogger();
     const instances: Instance[] = [];
     for (let index = 0; index < (options.instances ?? 1); index++) {
@@ -153,7 +146,7 @@ export const startHarness = async (options: HarnessOptions = {}) => {
             authConfig: loadAuthConfigFromEnv(),
             outboundPolicy: undefined,
             log: log.child({ pod: index }),
-            history,
+            graphBase: connector.graphBase,
             attachmentHosts: [/^127\.0\.0\.1$/],
             timing: { ...FAST, ...options.timing },
             podId: `pod-${index}`,
@@ -170,7 +163,7 @@ export const startHarness = async (options: HarnessOptions = {}) => {
     const activity = (overrides: Record<string, unknown>) => ({
         type: 'message',
         id: nextMessageId(),
-        timestamp: new Date().toISOString(),
+        timestamp: (options.now?.() ?? new Date()).toISOString(),
         channelId: 'msteams',
         serviceUrl: connector.url,
         from: { id: '29:user', name: 'Jane Doe', aadObjectId: USER },
@@ -243,9 +236,11 @@ export const startHarness = async (options: HarnessOptions = {}) => {
 
     const admin = { id: '29:admin', name: 'Ada Admin', aadObjectId: ADMIN };
 
-    const post = async (body: unknown, instance = 0) => {
+    /** Delivers an activity to an instance; a post in a channel shows in Teams (Graph) before the bot hears of it. */
+    const post = async (body: Record<string, unknown>, instance = 0) => {
         const target = instances[instance];
         if (!target) throw new Error(`no instance ${instance}`);
+        connector.human(body);
         const response = await fetch(`${target.base}/api/messages`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
@@ -269,7 +264,6 @@ export const startHarness = async (options: HarnessOptions = {}) => {
                     job_enabled: 'true',
                     job_cron: '',
                     job_timezone: 'Europe/Berlin',
-                    job_max_runtime: '60',
                     ...inputs,
                 },
                 admin

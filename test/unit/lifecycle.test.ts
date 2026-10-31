@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import sharp from 'sharp';
-import { CHANNEL, eventually, type Harness, startHarness } from '../helpers/harness.ts';
+import { CHANNEL, eventually, type Harness, startHarness, TEAM_GROUP } from '../helpers/harness.ts';
 import { newWebhookSecret, signWebhook, webhookBody } from '../helpers/webhooks.ts';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -19,7 +19,7 @@ describe('lifecycle and webhooks', () => {
         await h.stop();
     });
 
-    it('archives an inactive conversation quietly; a later reply continues with the log', async () => {
+    it('archives an inactive conversation quietly; a later reply continues with the thread from Teams', async () => {
         const sb = h.instances[0]?.sb;
         assert.ok(sb);
         const png = await sharp({ create: { width: 2, height: 2, channels: 3, background: '#000' } })
@@ -31,6 +31,10 @@ describe('lifecycle and webhooks', () => {
                 { contentType: 'image/png', contentUrl: `${h.connector.url}attachments/pic`, name: 'pic.png' },
             ],
         });
+        // in Graph, the picture is a hosted content of the message
+        h.connector.hostedContents.set('pic', { type: 'image/png', data: png });
+        const hosted = `${h.connector.graphBase}/teams/${TEAM_GROUP}/channels/${encodeURIComponent(CHANNEL)}/messages/${root.id}/hostedContents/pic/$value`;
+        h.connector.human(root, { html: `<p>Remember this picture</p><p><img src="${hosted}" alt="pic.png"></p>` });
         await h.post(root);
         await eventually(() => h.thread(root.id).some((t) => t.startsWith('Echo:')));
         const sessionId = [...h.claude.sessions.keys()].at(-1) ?? '';
@@ -45,17 +49,21 @@ describe('lifecycle and webhooks', () => {
         await h.post(h.message('Back again', { rootId: root.id }));
         await eventually(() => h.thread(root.id).some((t) => t === 'Echo: Back again'));
         const content = h.firstContent();
+        const first = content[1]?.text ?? '';
         assert.match(
-            content[1]?.text ?? '',
+            first,
             new RegExp(`^\\[switchboard:continuation\\] previous_session=${sessionId} reason=archived`)
         );
+        assert.match(first, /Remember this picture\s+\[image: pic\.png\]/);
+        assert.match(first, new RegExp(`agent \\(session ${sessionId}\\) answered:\\n {4}Echo: Remember this picture`));
+        assert.match(first, new RegExp(`session ${sessionId} ended: archived`));
         assert.ok(
             content.some((block) => block.type === 'image'),
-            'images of the latest messages come along'
+            'images of the latest messages come along, read from Teams'
         );
     });
 
-    it('deletes everything after the retention period; a later reply reads the history from Teams', async () => {
+    it('deletes the augmentation after the retention period; a later reply reads the thread from Teams', async () => {
         const sb = h.instances[0]?.sb;
         assert.ok(sb);
         const conversations = await sb.entities.conversations.list({ partitionKey: CHANNEL });
@@ -67,16 +75,20 @@ describe('lifecycle and webhooks', () => {
         await sb.lifecycle.run();
         assert.equal((await sb.entities.conversations.list({ partitionKey: CHANNEL })).length, 0);
         assert.equal((await sb.entities.sessions.list()).length, 0);
-        assert.equal((await sb.entities.logs.list()).length, 0);
+        assert.equal((await sb.entities.posted.list()).length, 0);
+        assert.equal((await sb.entities.cards.list()).length, 0);
         assert.ok(h.claude.deletedSessions.length >= 2, 'sessions deleted in Claude');
         assert.equal(h.claude.files.size, 0, 'uploaded files deleted');
 
         const rootId = conversations[0]?.value.rootId ?? '';
+        const created = h.claude.createRequests.length;
         await h.post(h.message('Hello after a long time', { rootId }));
-        await eventually(() => h.thread(rootId).some((t) => t.includes('could not be read')));
+        await eventually(() => h.claude.createRequests.length === created + 1);
         const first = h.firstText();
-        assert.match(first, /reason=history_from_teams/);
-        assert.ok(first.includes('The earlier messages of this thread could not be read.'));
+        assert.match(first, /^\[switchboard:continuation\] previous_session=none reason=first_session/);
+        assert.ok(first.includes('Remember this picture'));
+        // without the augmentation, Switchboard's answers are plain app messages
+        assert.match(first, /app "Switchboard" wrote:\n {4}Echo: Remember this picture/);
     });
 
     it('drops duplicate webhook deliveries and rejects bad signatures', async () => {

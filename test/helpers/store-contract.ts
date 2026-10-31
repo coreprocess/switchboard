@@ -71,7 +71,6 @@ export const storeContract = (makeStore: () => Promise<Store>) => {
             cron: '7 * * * *',
             timezone: 'Europe/Berlin',
             enabled: true,
-            maxRuntimeMin: 60,
             updatedBy: 'admin',
             updatedAt: '2026-10-31T00:00:00.000Z',
         });

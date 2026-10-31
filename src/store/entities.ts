@@ -3,8 +3,9 @@ import { z } from 'zod';
 import type { Query, Row, Store, StoredRow, TableName } from './store.ts';
 
 /**
- * Switchboard's data model (concept: "Data model"): one schema per entity, validated whenever a row is read.
- * Every entity keeps its key fields in the row too, so a row decodes on its own.
+ * Switchboard's data model: what Teams does not know. Teams threads are the truth for what was said; Switchboard
+ * keeps no copies of messages, only the augmentation around them (who owns a thread, sessions, cards, jobs, …).
+ * One schema per entity, validated whenever a row is read; every entity keeps its key fields in the row too.
  */
 
 const optional = z.string().optional();
@@ -15,8 +16,6 @@ export const BindingSchema = z.object({
     tenantId: z.string(),
     workspaceId: z.string(),
     conversationDeploymentId: z.string(),
-    /** The team's Microsoft 365 group ID, for Graph (thread history). */
-    aadGroupId: optional,
     teamName: optional,
     channelName: z.string(),
     /** A known limitation of the channel (for example: not a standard channel), shown in `status`. */
@@ -36,7 +35,6 @@ export const JobSchema = z.object({
     cron: z.string(),
     timezone: z.string(),
     enabled: z.boolean(),
-    maxRuntimeMin: z.number(),
     /** Row key of the run that is active, or absent. */
     activeRun: optional,
     updatedBy: z.string(),
@@ -65,33 +63,36 @@ export const JobRunSchema = z.object({
 });
 export type JobRun = z.infer<typeof JobRunSchema>;
 
+/** How a thread came about: a person's post, a tool, a failed job run, or a notice from Switchboard. */
 export const CONVERSATION_ORIGINS = [
-    'human',
+    'thread',
     'start_new_conversation',
     'convert_to_conversation',
     'job_failure',
+    'notice',
 ] as const;
 
+/** The augmentation of a Teams thread; created the first time the thread matters to Switchboard. */
 export const ConversationSchema = z.object({
     channelId: z.string(),
+    /** The thread's root message ID, which is also the conversation's ID. */
     rootId: z.string(),
-    conversationId: z.string(),
     teamId: z.string(),
-    workspaceId: z.string(),
     origin: z.enum(CONVERSATION_ORIGINS),
     /** The owning session, or absent. */
     owningSession: optional,
-    /** Set while one pod creates the owning session; others wait for it. */
+    /** Set while one delivery creates the owning session; others wait for it. */
     claimedBy: optional,
     claimedUntil: optional,
     sessionCount: z.number(),
-    /** A thread Switchboard had not seen: its first session reads the thread's history from Teams. */
-    historyFromTeams: z.boolean().optional(),
     /** The last session that owned the thread and why it ended, for continuations. */
     previousSession: optional,
     previousReason: optional,
-    /** For threads started by `start_new_conversation`: the opening post, the briefing and the caller. */
-    openingText: optional,
+    /** The description sessions give their conversation (`describe_conversation`); tags as a JSON array. */
+    title: optional,
+    summary: optional,
+    tags: optional,
+    /** Threads opened with `start_new_conversation`: the briefing and the session that opened it. */
     briefing: optional,
     originSession: optional,
     createdAt: z.string(),
@@ -119,6 +120,7 @@ export const SessionSchema = z.object({
     seq: z.number(),
     state: z.enum(SESSION_STATES),
     endReason: optional,
+    endedAt: optional,
     /** Last event relayed; the relay continues after it. */
     watermarkEventId: optional,
     watermarkAt: optional,
@@ -127,10 +129,12 @@ export const SessionSchema = z.object({
     relayValidUntil: optional,
     /** The "working…" message in the thread, while a turn runs. */
     workingMessageId: optional,
-    /** Set before Switchboard interrupts or archives the session itself (timeout, inactivity, disconnect). */
+    /** Set before Switchboard interrupts or archives the session itself, with the reason. */
     stopping: optional,
     createdAt: z.string(),
     lastActivity: z.string(),
+    /** When Switchboard last sent the session input (messages, clicks, confirmations); waits compare with it. */
+    lastInputAt: optional,
 });
 export type SessionEntry = z.infer<typeof SessionSchema>;
 
@@ -144,49 +148,70 @@ export const CardSchema = z.object({
     teamId: z.string(),
     channelId: z.string(),
     rootId: z.string(),
-    conversationId: z.string(),
     /** The Teams message that shows the card. */
     activityId: optional,
     /** The card as last set by the agent (agent cards) or the confirmation's details (confirmations, JSON). */
     json: z.string(),
     state: z.enum(CARD_STATES),
+    /** The click that holds the lock (agent cards) or decided the confirmation. */
     lockedBy: optional,
     lockedAad: optional,
     lockedAt: optional,
     lockedChoice: optional,
+    /** The last click, for histories: verb, clicker, time and the click's data (JSON). */
+    lastClickVerb: optional,
+    lastClickBy: optional,
+    lastClickAad: optional,
+    lastClickAt: optional,
+    lastClickData: optional,
     /** Confirmation cards: the tool use waiting for it. */
     toolUseId: optional,
     createdAt: z.string(),
 });
 export type Card = z.infer<typeof CardSchema>;
 
-export const LogEntrySchema = z.object({
-    conversationId: z.string(),
-    entryKey: z.string(),
-    at: z.string(),
-    /** JSON of a `LogItem` (conversations/log.ts). */
-    item: z.string(),
-});
-export type LogEntry = z.infer<typeof LogEntrySchema>;
+export const POSTED_KINDS = ['opening', 'answer', 'update', 'card', 'note', 'session-message'] as const;
+export type PostedKind = (typeof POSTED_KINDS)[number];
 
+/** Which session posted a Teams message, and what kind it is: histories say who wrote Switchboard's messages. */
+export const PostedMessageSchema = z.object({
+    channelId: z.string(),
+    messageId: z.string(),
+    rootId: z.string(),
+    kind: z.enum(POSTED_KINDS),
+    sessionId: optional,
+    at: z.string(),
+});
+export type PostedMessage = z.infer<typeof PostedMessageSchema>;
+
+export const TOOL_CALL_STATUSES = ['started', 'waiting', 'done'] as const;
+
+/**
+ * A custom tool call, carried out at most once. `wait` calls stay `waiting` until their deadline, a message in
+ * the watched conversation, or a message for the session itself.
+ */
 export const ToolCallSchema = z.object({
     sessionId: z.string(),
     eventId: z.string(),
     tool: z.string(),
-    status: z.enum(['started', 'done']),
+    status: z.enum(TOOL_CALL_STATUSES),
     result: optional,
     isError: z.boolean().optional(),
+    /** When the result reached the session; it is sent once. */
+    answeredAt: optional,
     startedAt: z.string(),
+    /** Waits: when the wait ends at the latest, and the conversation it watches (`conversationKey`). */
+    waitUntil: optional,
+    waitWatch: optional,
 });
 export type ToolCall = z.infer<typeof ToolCallSchema>;
 
 export const UploadedFileSchema = z.object({
-    /** The conversation ID, or `session:<id>` for files of a job session. */
+    /** `conversationKey` of the conversation, or `session:<id>` for files of a session without one. */
     owner: z.string(),
     fileId: z.string(),
     workspaceId: z.string(),
-    kind: z.enum(['log', 'attachment']),
-    messageId: optional,
+    kind: z.enum(['history', 'image']),
     mediaType: z.string(),
     name: z.string(),
     size: z.number(),
@@ -199,6 +224,7 @@ export const TeamsRefSchema = z.object({
     tenantId: z.string(),
     serviceUrl: z.string(),
     botId: z.string(),
+    /** The team's Microsoft 365 group ID: Microsoft Graph addresses teams by it. */
     aadGroupId: optional,
     teamName: optional,
     updatedAt: z.string(),
@@ -292,8 +318,11 @@ export class Collection<T extends object> {
     }
 }
 
-/** Table Storage keys for IDs of unknown shape (Teams activity IDs, conversation IDs). */
+/** Table Storage keys for IDs of unknown shape (Teams activity IDs). */
 export const hashKey = (value: string) => createHash('sha256').update(value).digest('hex');
+
+/** The key that names a conversation across tables: `<channel>/<root message>`. */
+export const conversationKey = (channelId: string, rootId: string) => `${channelId}/${rootId}`;
 
 export const createEntities = (store: Store) => ({
     store,
@@ -303,7 +332,7 @@ export const createEntities = (store: Store) => ({
     conversations: new Collection(store, 'conversations', ConversationSchema, (c) => [c.channelId, c.rootId]),
     sessions: new Collection(store, 'sessions', SessionSchema, (s) => [s.sessionId, '']),
     cards: new Collection(store, 'cards', CardSchema, (c) => [c.cardId, '']),
-    logs: new Collection(store, 'logs', LogEntrySchema, (l) => [l.conversationId, l.entryKey]),
+    posted: new Collection(store, 'posted', PostedMessageSchema, (p) => [p.channelId, p.messageId]),
     toolCalls: new Collection(store, 'toolcalls', ToolCallSchema, (t) => [t.sessionId, t.eventId]),
     files: new Collection(store, 'files', UploadedFileSchema, (f) => [f.owner, f.fileId]),
     teamsRefs: new Collection(store, 'teamsrefs', TeamsRefSchema, (t) => [t.teamId, '']),

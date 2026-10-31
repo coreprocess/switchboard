@@ -64,12 +64,14 @@ export interface Settings {
     anthropicBaseUrl: string | undefined;
     store: StoreSettings;
     defaultTimezone: string;
-    defaultJobMaxRuntimeMin: number;
+    /** A job run longer than this got stuck (technical safety limit; budgets limit cost and work). */
+    jobMaxRuntimeHours: number;
     sessionArchiveAfterDays: number;
     conversationRetentionDays: number;
     attachmentMaxBytes: number;
     attachmentTypes: string[];
-    logInlineLimitBytes: number;
+    /** Histories up to this size go into a continuation's first message; longer ones into a file. */
+    historyInlineLimitBytes: number;
     botClientId: string | undefined;
 }
 
@@ -172,7 +174,7 @@ export const loadSettings = (env: NodeJS.ProcessEnv): Settings => {
         anthropicBaseUrl: env.ANTHROPIC_BASE_URL?.trim() || undefined,
         store: storeOf(env, production),
         defaultTimezone,
-        defaultJobMaxRuntimeMin: integer(env, 'DEFAULT_JOB_MAX_RUNTIME_MIN', 60),
+        jobMaxRuntimeHours: integer(env, 'JOB_MAX_RUNTIME_HOURS', 24),
         sessionArchiveAfterDays: integer(env, 'SESSION_ARCHIVE_AFTER_DAYS', 30),
         conversationRetentionDays: integer(env, 'CONVERSATION_RETENTION_DAYS', 90),
         attachmentMaxBytes: integer(env, 'ATTACHMENT_MAX_MB', 20) * 1024 * 1024,
@@ -180,7 +182,7 @@ export const loadSettings = (env: NodeJS.ProcessEnv): Settings => {
             .split(',')
             .map((t) => t.trim())
             .filter(Boolean),
-        logInlineLimitBytes: integer(env, 'LOG_INLINE_LIMIT_KB', 50) * 1024,
+        historyInlineLimitBytes: integer(env, 'HISTORY_INLINE_LIMIT_KB', 50) * 1024,
         botClientId,
     };
 };

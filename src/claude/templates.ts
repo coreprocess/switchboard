@@ -59,7 +59,7 @@ export interface BuildInput {
     metadata: Record<string, string>;
     /** Conversations: Switchboard's part of the first message, after the deployment's text. */
     firstContent?: ContentBlock[];
-    /** Files to mount, for example a long conversation log. */
+    /** Files to mount, for example a long conversation history. */
     files?: FileResource[];
 }
 

@@ -1,7 +1,7 @@
 import { APIError } from '@anthropic-ai/sdk';
 import { addDays } from '../core/time.ts';
 import { KEPT_RUNS } from '../jobs/jobs.ts';
-import { type Conversation, markSeen, type SessionEntry } from '../store/entities.ts';
+import { type Conversation, conversationKey, markSeen, type SessionEntry } from '../store/entities.ts';
 import type { Switchboard } from '../switchboard.ts';
 
 /** IDs used for deduplication, and tool call results, are kept this long. */
@@ -10,7 +10,8 @@ const SHORT_LIVED_DAYS = 7;
 /**
  * The daily cleanup (concept: "Lifecycle: archive and delete"). Claude keeps sessions until they are deleted, so
  * Switchboard archives inactive conversations' sessions and, after the retention period, deletes the sessions,
- * the files it uploaded and its own data. Exactly one pod runs it per day (claimed like a job tick).
+ * the files it uploaded and its augmentation of the thread. The thread itself stays in Teams; a later reply is
+ * handled like any other. Exactly one pod runs it per day (claimed like a job tick).
  */
 export class Lifecycle {
     readonly #sb: Switchboard;
@@ -56,7 +57,7 @@ export class Lifecycle {
             ],
         });
         for (const { value: conversation } of inactive) {
-            await this.#each('archive', conversation.conversationId, async () => {
+            await this.#each('archive', conversationKey(conversation.channelId, conversation.rootId), async () => {
                 const entry = conversation.owningSession
                     ? await sb.sessions.get(conversation.owningSession)
                     : undefined;
@@ -101,21 +102,19 @@ export class Lifecycle {
             where: [{ field: 'lastActivity', op: 'lt', value: cutoff }],
         });
         for (const { value: conversation } of expired) {
-            await this.#each('delete', conversation.conversationId, () => this.#deleteConversation(conversation));
+            const key = conversationKey(conversation.channelId, conversation.rootId);
+            await this.#each('delete', key, () => this.#deleteConversation(conversation));
         }
     }
 
     async #deleteConversation(conversation: Conversation) {
         const sb = this.#sb;
-        const api = sb.workspaces.has(conversation.workspaceId)
-            ? sb.workspaces.get(conversation.workspaceId)
-            : undefined;
-        const sessions = await sb.entities.sessions.list({
-            where: [
-                { field: 'channelId', op: 'eq', value: conversation.channelId },
-                { field: 'rootId', op: 'eq', value: conversation.rootId },
-            ],
-        });
+        const { channelId, rootId } = conversation;
+        const inThread = [
+            { field: 'channelId', op: 'eq', value: channelId },
+            { field: 'rootId', op: 'eq', value: rootId },
+        ] as const;
+        const sessions = await sb.entities.sessions.list({ where: [...inThread] });
         let remaining = 0;
         for (const { value: session } of sessions) {
             if (session.state === 'active') {
@@ -127,25 +126,43 @@ export class Lifecycle {
                     continue;
                 }
             }
-            await api?.deleteSession(session.sessionId);
-            await sb.entities.sessions.delete(session.sessionId);
-            await this.#deleteToolCalls(session.sessionId);
+            await this.#deleteSession(session);
         }
-        // the conversation goes only once all its sessions are gone, so nothing with Teams content stays behind
+        // the augmentation goes only once all its sessions are gone, so nothing about the thread stays behind
         if (remaining > 0) return;
-        for (const { value: file } of await sb.entities.files.list({ partitionKey: conversation.conversationId })) {
-            await api?.deleteFile(file.fileId);
+        await this.#deleteFiles(conversationKey(channelId, rootId));
+        for (const { value: posted } of await sb.entities.posted.list({
+            partitionKey: channelId,
+            where: [inThread[1]],
+        })) {
+            await sb.entities.posted.delete(posted.channelId, posted.messageId);
+        }
+        for (const { value: card } of await sb.entities.cards.list({ where: [...inThread] })) {
+            await sb.entities.cards.delete(card.cardId);
+        }
+        await sb.entities.conversations.delete(channelId, rootId);
+        sb.log.info({ channelId, rootId, sessions: sessions.length }, 'conversation deleted');
+    }
+
+    async #deleteSession(session: SessionEntry) {
+        const sb = this.#sb;
+        if (sb.workspaces.has(session.workspaceId)) {
+            await sb.workspaces.get(session.workspaceId).deleteSession(session.sessionId);
+        }
+        await this.#deleteFiles(`session:${session.sessionId}`);
+        await sb.entities.sessions.delete(session.sessionId);
+        for (const { value: call } of await sb.entities.toolCalls.list({ partitionKey: session.sessionId })) {
+            await sb.entities.toolCalls.delete(call.sessionId, call.eventId);
+        }
+    }
+
+    /** Files Switchboard uploaded for a conversation or a session, in Claude and in the store. */
+    async #deleteFiles(owner: string) {
+        const sb = this.#sb;
+        for (const { value: file } of await sb.entities.files.list({ partitionKey: owner })) {
+            if (sb.workspaces.has(file.workspaceId)) await sb.workspaces.get(file.workspaceId).deleteFile(file.fileId);
             await sb.entities.files.delete(file.owner, file.fileId);
         }
-        for (const { value: entry } of await sb.entities.logs.list({ partitionKey: conversation.conversationId })) {
-            await sb.entities.logs.delete(entry.conversationId, entry.entryKey);
-        }
-        const cards = await sb.entities.cards.list({
-            where: [{ field: 'conversationId', op: 'eq', value: conversation.conversationId }],
-        });
-        for (const { value: card } of cards) await sb.entities.cards.delete(card.cardId);
-        await sb.entities.conversations.delete(conversation.channelId, conversation.rootId);
-        sb.log.info({ conversationId: conversation.conversationId, sessions: sessions.length }, 'conversation deleted');
     }
 
     /**
@@ -174,24 +191,8 @@ export class Lifecycle {
         }
         const endedAt = run?.endedAt ?? session.lastActivity;
         if (session.state === 'active' || endedAt >= cutoff) return;
-        if (sb.workspaces.has(session.workspaceId)) {
-            await sb.workspaces.get(session.workspaceId).deleteSession(session.sessionId);
-        }
-        for (const { value: file } of await sb.entities.files.list({
-            partitionKey: `session:${session.sessionId}`,
-        })) {
-            if (sb.workspaces.has(file.workspaceId)) await sb.workspaces.get(file.workspaceId).deleteFile(file.fileId);
-            await sb.entities.files.delete(file.owner, file.fileId);
-        }
-        await sb.entities.sessions.delete(session.sessionId);
-        await this.#deleteToolCalls(session.sessionId);
+        await this.#deleteSession(session);
         sb.log.info({ sessionId: session.sessionId }, 'job session deleted');
-    }
-
-    async #deleteToolCalls(sessionId: string) {
-        for (const { value: call } of await this.#sb.entities.toolCalls.list({ partitionKey: sessionId })) {
-            await this.#sb.entities.toolCalls.delete(call.sessionId, call.eventId);
-        }
     }
 
     /** The latest `KEPT_RUNS` runs per job are kept. */

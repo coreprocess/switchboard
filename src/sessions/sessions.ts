@@ -1,6 +1,6 @@
 import type { OutgoingEvent } from '../claude/api.ts';
 import type { ContentBlock, FileResource, SessionKind } from '../claude/templates.ts';
-import type { ChannelRef } from '../core/gateway.ts';
+import { channelOf } from '../conversations/conversations.ts';
 import { clip, splitMessage } from '../core/text.ts';
 import { formatLocal } from '../core/time.ts';
 import type { Binding, SessionEntry } from '../store/entities.ts';
@@ -27,7 +27,6 @@ export interface CreateSessionInput {
     deploymentId: string;
     /** Conversations: the thread's root message. */
     rootId?: string;
-    conversationId?: string;
     /** Jobs: the job and run. */
     jobId?: string;
     runKey?: string;
@@ -45,10 +44,6 @@ export class Sessions {
 
     constructor(sb: Switchboard) {
         this.#sb = sb;
-    }
-
-    channelOf(entry: Pick<SessionEntry, 'teamId' | 'channelId'>): ChannelRef {
-        return { teamId: entry.teamId, channelId: entry.channelId };
     }
 
     async get(sessionId: string): Promise<SessionEntry | undefined> {
@@ -80,7 +75,7 @@ export class Sessions {
             metadata: {
                 switchboard_binding: clip(binding.channelId, 500),
                 switchboard_kind: input.kind,
-                ...(input.conversationId ? { switchboard_conversation: input.conversationId } : {}),
+                ...(input.rootId ? { switchboard_conversation: clip(input.rootId, 500) } : {}),
                 ...(input.jobId && input.runKey
                     ? { switchboard_job_run: clip(`${input.jobId}/${input.runKey}`, 500) }
                     : {}),
@@ -124,26 +119,36 @@ export class Sessions {
         await this.sendEvents(entry, [{ type: 'user.message', content }]);
     }
 
-    /** Sends events (messages, confirmations), records the activity and follows the session. */
+    /**
+     * Sends events (messages, confirmations), records the activity and follows the session. Input for the session
+     * ends its wait first, so it handles the input at once.
+     */
     async sendEvents(entry: SessionEntry, events: OutgoingEvent[]) {
         const sb = this.#sb;
-        await sb.workspaces.get(entry.workspaceId).sendEvents(entry.sessionId, events);
+        // recorded before the waits are looked at, so a wait stored meanwhile sees the input (`Tools`)
+        const now = sb.now().toISOString();
         const touched = await this.modify(entry.sessionId, (current) => ({
             ...current,
-            lastActivity: sb.now().toISOString(),
+            lastActivity: now,
+            lastInputAt: now,
         }));
+        await sb.waits.sessionInput(entry.sessionId);
+        await sb.workspaces.get(entry.workspaceId).sendEvents(entry.sessionId, events);
         if (touched?.value.rootId) await this.ensureWorking(touched.value);
         await sb.relay.wake(entry.sessionId);
     }
 
-    /** Posts the "working…" message in the session's thread unless one is shown already. */
+    /**
+     * Posts the "working…" message in the session's thread unless one is shown already. It is a status, not a
+     * message of the conversation: it is not attributed and becomes one only when the answer replaces it.
+     */
     async ensureWorking(entry: SessionEntry) {
         const sb = this.#sb;
         if (!entry.rootId || entry.workingMessageId) return;
-        const channel = this.channelOf(entry);
+        const channel = channelOf(entry);
         let posted: string;
         try {
-            posted = (await sb.gateway.reply(channel, entry.rootId, { text: WORKING_TEXT })).messageId;
+            posted = (await sb.platform.reply(channel, entry.rootId, { text: WORKING_TEXT })).messageId;
         } catch (error) {
             sb.log.warn({ err: error, sessionId: entry.sessionId }, 'working message not posted');
             return;
@@ -154,7 +159,7 @@ export class Sessions {
                 : { ...current, workingMessageId: posted }
         );
         if (written?.value.workingMessageId !== posted) {
-            await sb.gateway.delete(channel, entry.rootId, posted).catch(() => undefined);
+            await sb.platform.delete(channel, entry.rootId, posted).catch(() => undefined);
         }
     }
 
@@ -175,42 +180,37 @@ export class Sessions {
     async post(entry: SessionEntry, text: string, update: boolean): Promise<string | undefined> {
         const sb = this.#sb;
         if (!entry.rootId) return undefined;
-        const channel = this.channelOf(entry);
+        const channel = channelOf(entry);
+        const options = { kind: update ? 'update' : 'answer', sessionId: entry.sessionId } as const;
         // the final answer replaces the "working…" message; an update moves it below itself, so the answer ends up
         // after the updates
         const working = await this.takeWorking(entry.sessionId);
-        if (update && working) await sb.gateway.delete(channel, entry.rootId, working).catch(() => undefined);
         const chunks = splitMessage(text);
-        if (chunks.length === 0) {
-            if (working) await sb.gateway.delete(channel, entry.rootId, working).catch(() => undefined);
-            return undefined;
+        if (working && (update || chunks.length === 0)) {
+            await sb.platform.delete(channel, entry.rootId, working).catch(() => undefined);
         }
         let first: string | undefined;
         for (const [index, chunk] of chunks.entries()) {
             if (index === 0 && working && !update) {
-                await sb.gateway.update(channel, entry.rootId, working, { text: chunk });
+                await sb.conversations.publish(channel, entry.rootId, working, { text: chunk }, options);
                 first = working;
                 continue;
             }
-            const { messageId } = await sb.gateway.reply(channel, entry.rootId, { text: chunk });
+            const { messageId } = await sb.conversations.post(channel, entry.rootId, { text: chunk }, options);
             first ??= messageId;
         }
-        await sb.conversations.record(entry.channelId, entry.rootId, {
-            kind: 'agent',
-            session: entry.sessionId,
-            text,
-            update,
-        });
         if (update && working) await this.ensureWorking({ ...entry, workingMessageId: undefined });
         return first;
     }
 
-    /** A notice from Switchboard in the session's thread (not logged as agent text). */
+    /** A notice from Switchboard in the session's thread. */
     async notice(entry: SessionEntry, text: string) {
         if (!entry.rootId) return;
-        await this.#sb.gateway.reply(this.channelOf(entry), entry.rootId, { text }).catch((error: unknown) => {
-            this.#sb.log.warn({ err: error, sessionId: entry.sessionId }, 'notice not posted');
-        });
+        await this.#sb.conversations
+            .post(channelOf(entry), entry.rootId, { text }, { kind: 'note' })
+            .catch((error: unknown) => {
+                this.#sb.log.warn({ err: error, sessionId: entry.sessionId }, 'notice not posted');
+            });
     }
 
     /**
@@ -226,6 +226,7 @@ export class Sessions {
                 ...current,
                 state: reason === 'archived' ? 'archived' : 'ended',
                 endReason: reason,
+                endedAt: sb.now().toISOString(),
                 relayOwner: undefined,
                 relayValidUntil: undefined,
             };
@@ -242,15 +243,9 @@ export class Sessions {
         const sb = this.#sb;
         if (!entry.rootId) return;
         const working = await this.takeWorking(entry.sessionId);
-        if (working) await sb.gateway.delete(this.channelOf(entry), entry.rootId, working).catch(() => undefined);
+        if (working) await sb.platform.delete(channelOf(entry), entry.rootId, working).catch(() => undefined);
         await sb.conversations.detach(entry.channelId, entry.rootId, entry.sessionId, reason);
         await sb.cards.closeAll(entry.sessionId);
-        await sb.conversations.record(entry.channelId, entry.rootId, {
-            kind: 'session',
-            event: 'ended',
-            session: entry.sessionId,
-            reason,
-        });
         if (notify) await this.notice(entry, endNotice(reason));
     }
 

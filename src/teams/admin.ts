@@ -1,14 +1,15 @@
 import { randomBytes } from 'node:crypto';
 import type { DeploymentInfo } from '../claude/templates.ts';
 import { isTimeZone } from '../config/env.ts';
-import type { CardJson, ChannelRef } from '../core/gateway.ts';
+import { channelOf } from '../conversations/conversations.ts';
+import type { CardJson, ChannelRef } from '../core/platform.ts';
 import { clip } from '../core/text.ts';
 import { formatLocal } from '../core/time.ts';
 import { isValidCron, nextRun } from '../jobs/jobs.ts';
 import type { Binding, Job } from '../store/entities.ts';
 import type { Switchboard } from '../switchboard.ts';
 import type { Command } from './activity.ts';
-import type { TeamsGateway } from './gateway.ts';
+import type { TeamsPlatform } from './platform.ts';
 import { describeDeployment, parseChoice, renderSettingsCard, type SettingsInput } from './settings-card.ts';
 
 export const ONLY_ADMINS = 'Only Switchboard admins can change this.';
@@ -24,7 +25,6 @@ export interface Actor {
 
 export interface ChannelContext extends ChannelRef {
     tenantId: string;
-    aadGroupId: string | undefined;
     teamName: string | undefined;
 }
 
@@ -35,9 +35,9 @@ const PRIVATE_CHANNEL_NOTE =
 /** Bindings, jobs and the commands (concept: "Admins and access", "Commands and the settings card"). */
 export class ChannelAdmin {
     readonly #sb: Switchboard;
-    readonly #teams: TeamsGateway;
+    readonly #teams: TeamsPlatform;
 
-    constructor(sb: Switchboard, teams: TeamsGateway) {
+    constructor(sb: Switchboard, teams: TeamsPlatform) {
         this.#sb = sb;
         this.#teams = teams;
     }
@@ -111,7 +111,6 @@ export class ChannelAdmin {
             ...(job ? { job } : {}),
             options,
             defaultTimezone: sb.settings.defaultTimezone,
-            defaultMaxRuntimeMin: sb.settings.defaultJobMaxRuntimeMin,
             ...(status ? { status } : {}),
             ...(problems ? { problems } : {}),
         });
@@ -144,13 +143,10 @@ export class ChannelAdmin {
         }
         const cron = (input.job_cron ?? '').trim();
         const timezone = (input.job_timezone ?? '').trim() || sb.settings.defaultTimezone;
-        const maxRuntimeMin = Number(input.job_max_runtime ?? sb.settings.defaultJobMaxRuntimeMin);
         if (jobChoice) {
             if (!isTimeZone(timezone)) problems.push(`Unknown time zone "${clip(timezone, 60)}".`);
             else if (!isValidCron(cron, timezone))
                 problems.push('The schedule must be a cron expression with five fields.');
-            if (!Number.isInteger(maxRuntimeMin) || maxRuntimeMin < 1)
-                problems.push('The maximum run time must be at least 1 minute.');
         }
         if (problems.length === 0 && conversation) {
             problems.push(
@@ -165,16 +161,12 @@ export class ChannelAdmin {
         const by = actor.aadObjectId ?? 'unknown';
         const existing = await this.binding(channel);
         const info = await this.#channelInfo(channel);
-        let aadGroupId = existing?.aadGroupId ?? channel.aadGroupId;
-        if (!aadGroupId)
-            aadGroupId = (await this.#teams.teamDetails(channel.teamId).catch(() => undefined))?.aadGroupId;
         const binding: Binding = {
             teamId: channel.teamId,
             channelId: channel.channelId,
             tenantId: channel.tenantId,
             workspaceId: conversation.workspaceId,
             conversationDeploymentId: conversation.deploymentId,
-            aadGroupId,
             teamName: channel.teamName ?? existing?.teamName,
             channelName: existing?.channelName && info.name === 'channel' ? existing.channelName : info.name,
             channelNote: info.listed ? undefined : PRIVATE_CHANNEL_NOTE,
@@ -194,7 +186,6 @@ export class ChannelAdmin {
                 cron,
                 timezone,
                 enabled: input.job_enabled !== 'false',
-                maxRuntimeMin,
                 activeRun: job?.activeRun,
                 updatedBy: by,
                 updatedAt: now,
@@ -211,7 +202,8 @@ export class ChannelAdmin {
 
     /**
      * Removes the binding: the job is cancelled and deleted, owning sessions are archived (running ones are
-     * interrupted first and archived by the reconciler once idle), their cards close. Logs stay until retention.
+     * interrupted first and archived by the reconciler once idle), their cards close. The augmentation of the
+     * channel's threads stays until retention.
      */
     async disconnect(binding: Binding, actor: Actor) {
         const sb = this.#sb;
@@ -229,8 +221,8 @@ export class ChannelAdmin {
             });
         }
         sb.log.info({ channelId: binding.channelId, by: actor.aadObjectId }, 'binding removed');
-        await sb.gateway
-            .postThread(binding, {
+        await sb.platform
+            .postThread(channelOf(binding), {
                 text: '🔌 Switchboard was disconnected from this channel. Messages here no longer reach an agent.',
             })
             .catch(() => undefined);
@@ -262,9 +254,12 @@ export class ChannelAdmin {
             const last = await sb.jobs.latestRun(job.jobId);
             const next = job.enabled ? nextRun(job, sb.now()) : undefined;
             lines.push(`- Job deployment: ${await this.#describe(binding.workspaceId, job.deploymentId)}`);
+            const lastRun = last
+                ? `${last.status === 'running' ? 'running since' : `${last.status}${last.reason ? ` (${clip(last.reason, 120)})` : ''}, started`} ` +
+                  formatLocal(new Date(last.startedAt), zone)
+                : 'none';
             lines.push(
-                `- Job: \`${job.cron}\` (${job.timezone}), ${job.enabled ? 'on' : 'paused'}, at most ${job.maxRuntimeMin} min` +
-                    `; last run: ${last ? `${last.status}${last.reason ? ` (${clip(last.reason, 120)})` : ''} at ${formatLocal(new Date(last.startedAt), zone)}` : 'none'}` +
+                `- Job: \`${job.cron}\` (${job.timezone}), ${job.enabled ? 'on' : 'paused'}; last run: ${lastRun}` +
                     `; next run: ${next ? formatLocal(next, zone) : '–'}`
             );
         } else {

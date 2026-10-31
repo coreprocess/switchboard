@@ -3,13 +3,13 @@ import type { TurnContext } from '@microsoft/agents-hosting';
 import { z } from 'zod';
 import type { IncomingAttachment } from '../attachments/attachments.ts';
 import { CARD_DATA_KEY, CONFIRMATION_DATA_KEY } from '../cards/cards.ts';
-import type { CardJson } from '../core/gateway.ts';
+import type { CardJson } from '../core/platform.ts';
 import { clip } from '../core/text.ts';
 import { markSeen } from '../store/entities.ts';
 import type { Switchboard } from '../switchboard.ts';
 import { commandOf, isBotMentioned, messageText, type TeamsOrigin, teamsOriginOf } from './activity.ts';
 import { type Actor, ChannelAdmin, type ChannelContext, NOT_SET_UP } from './admin.ts';
-import type { TeamsGateway } from './gateway.ts';
+import type { TeamsPlatform } from './platform.ts';
 import { SETTINGS_DATA_KEY, SettingsInput, VERB_DISCONNECT, VERB_SAVE } from './settings-card.ts';
 
 export const ONLY_IN_CHANNELS =
@@ -26,13 +26,17 @@ const CardAction = z.object({
 
 const ID = z.string().regex(/^[A-Za-z0-9_-]{1,200}$/);
 
-/** Handles activities from Teams: messages and commands in channels, and card clicks. */
+/**
+ * Handles activities from Teams: messages and commands in channels, and card clicks. A command never reaches an
+ * agent; every other message in a bound channel does, so a thread becomes a conversation with its first message
+ * that is not a command.
+ */
 export class TeamsBot {
     readonly #sb: Switchboard;
-    readonly #teams: TeamsGateway;
+    readonly #teams: TeamsPlatform;
     readonly #admin: ChannelAdmin;
 
-    constructor(sb: Switchboard, teams: TeamsGateway) {
+    constructor(sb: Switchboard, teams: TeamsPlatform) {
         this.#sb = sb;
         this.#teams = teams;
         this.#admin = new ChannelAdmin(sb, teams);
@@ -87,7 +91,6 @@ export class TeamsBot {
             teamId: origin.teamId,
             channelId: origin.channelId,
             tenantId: origin.tenantId,
-            aadGroupId: origin.aadGroupId,
             teamName: origin.teamName,
         };
     }
@@ -127,18 +130,10 @@ export class TeamsBot {
         }
         const aadObjectId = activity.from?.aadObjectId;
         if (!aadObjectId || !activity.id) return;
-        const rootId = origin.rootId ?? activity.id;
-        if (!binding.aadGroupId && origin.aadGroupId) {
-            await sb.entities.bindings.modify(binding.teamId, binding.channelId, (current) => ({
-                ...current,
-                aadGroupId: origin.aadGroupId,
-            }));
-        }
-        await sb.conversations.onHuman({
-            binding: { ...binding, aadGroupId: binding.aadGroupId ?? origin.aadGroupId },
-            rootId,
+        await sb.delivery.fromPerson({
+            binding,
+            rootId: origin.rootId ?? activity.id,
             messageId: activity.id,
-            isRoot: rootId === activity.id,
             from: { name: activity.from?.name, aadObjectId },
             at: activity.timestamp ? new Date(activity.timestamp) : sb.now(),
             text: messageText(activity),

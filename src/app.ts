@@ -2,15 +2,13 @@ import { type AuthConfiguration, CloudAdapter, type OutboundUrlPolicy } from '@m
 import type { ClaudeWorkspaces } from './claude/api.ts';
 import { loadAppendix, Templates } from './claude/templates.ts';
 import type { Settings } from './config/env.ts';
-import type { HistoryReader } from './conversations/conversations.ts';
 import type { Logger } from './core/logger.ts';
 import { createHttpApp } from './server/http.ts';
 import { createEntities } from './store/entities.ts';
 import type { Store } from './store/store.ts';
 import { type Core, Switchboard, type Timing } from './switchboard.ts';
 import { TeamsBot } from './teams/bot.ts';
-import { TeamsGateway } from './teams/gateway.ts';
-import { GraphHistory } from './teams/history.ts';
+import { TeamsPlatform } from './teams/platform.ts';
 import { claudeWebhookHandler } from './webhooks/claude.ts';
 
 export interface AppOptions {
@@ -22,8 +20,8 @@ export interface AppOptions {
     /** Restricts the hosts the bot calls; the Microsoft default list in production. */
     outboundPolicy: OutboundUrlPolicy | undefined;
     log: Logger;
-    /** Tests: a history reader instead of Microsoft Graph, attachment hosts, timings, clock, pod ID. */
-    history?: HistoryReader;
+    /** Tests: Microsoft Graph's base URL, attachment hosts, timings, clock, pod ID. */
+    graphBase?: string;
     attachmentHosts?: RegExp[];
     timing?: Partial<Timing>;
     now?: () => Date;
@@ -38,10 +36,11 @@ export const createApp = (options: AppOptions) => {
         log.error({ err: error }, 'turn failed');
     };
     const entities = createEntities(options.store);
-    const teams = new TeamsGateway({
+    const teams = new TeamsPlatform({
         adapter,
         entities,
         botAppId: options.authConfig.clientId ?? '',
+        ...(options.graphBase ? { graphBase: options.graphBase } : {}),
         ...(options.attachmentHosts ? { attachmentHosts: options.attachmentHosts } : {}),
     });
     const core: Core = {
@@ -49,8 +48,7 @@ export const createApp = (options: AppOptions) => {
         entities,
         workspaces: options.workspaces,
         templates: new Templates(options.workspaces, loadAppendix()),
-        gateway: teams,
-        history: options.history ?? new GraphHistory((scope) => teams.token(scope)),
+        platform: teams,
         log,
         ...(options.podId ? { podId: options.podId } : {}),
         ...(options.now ? { now: options.now } : {}),
