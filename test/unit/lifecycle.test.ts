@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import sharp from 'sharp';
 import { CHANNEL, eventually, type Harness, startHarness } from '../helpers/harness.ts';
-import { signWebhook, webhookBody } from '../helpers/webhooks.ts';
+import { newWebhookSecret, signWebhook, webhookBody } from '../helpers/webhooks.ts';
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -85,10 +85,7 @@ describe('lifecycle and webhooks', () => {
             fetch(`${h.instances[0]?.base}/webhooks/claude`, { method: 'POST', headers, body });
         assert.equal((await send(signWebhook(h.secret, 'whe_dup', body))).status, 204);
         assert.equal((await send(signWebhook(h.secret, 'whe_dup', body))).status, 204);
-        assert.equal(
-            (await send(signWebhook('whsec_d3JvbmdzZWNyZXR3cm9uZ3NlY3JldHdyb25nc2VjcmV0', 'whe_x', body))).status,
-            400
-        );
+        assert.equal((await send(signWebhook(newWebhookSecret(), 'whe_x', body))).status, 400);
     });
 
     it('posts a note when a vault credential of a channel’s deployment cannot be refreshed', async () => {
