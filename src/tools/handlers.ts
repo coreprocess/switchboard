@@ -3,7 +3,14 @@ import { type Description, parseTags, titleOf } from '../conversations/conversat
 import type { HistoryEntry } from '../conversations/history.ts';
 import { type ChannelRef, CursorError, type ThreadSummary } from '../core/platform.ts';
 import { clip, neutralise } from '../core/text.ts';
-import { type Binding, type Conversation, conversationKey, type SessionEntry } from '../store/entities.ts';
+import {
+    type Binding,
+    type Conversation,
+    conversationKey,
+    forgetSeen,
+    markSeen,
+    type SessionEntry,
+} from '../store/entities.ts';
 import type { Switchboard } from '../switchboard.ts';
 import { type ToolInput, ToolInputs, type ToolName } from './definitions.ts';
 import { MAX_WAIT_MINUTES } from './waits.ts';
@@ -114,6 +121,7 @@ export class ToolHandlers {
         convert_to_conversation: (context, input) =>
             this.#convertToConversation(context, parse(ToolInputs.convert_to_conversation, input)),
         wait: (context, input) => this.#wait(context, parse(ToolInputs.wait, input)),
+        notify_admins: (context, input) => this.#notifyAdmins(context, parse(ToolInputs.notify_admins, input)),
     };
 
     /** Carries a call out with its input validated. */
@@ -278,6 +286,52 @@ export class ToolHandlers {
         const minutes = Math.min(input.minutes, MAX_WAIT_MINUTES);
         const until = new Date(sb.now().getTime() + minutes * 60_000).toISOString();
         return { wait: { until, ...(watch ? { watch } : {}) } };
+    }
+
+    /**
+     * A message to the admins as a thread of its own, with an @mention of each. Once per channel and (UTC) day,
+     * claimed by inserting the day's entry; later calls that day get the link to the earlier message.
+     */
+    async #notifyAdmins({ entry, binding, channel }: ToolContext, input: ToolInput<'notify_admins'>) {
+        const sb = this.#sb;
+        const day = sb.now().toISOString().slice(0, 10);
+        const key = `${binding.channelId}|${day}`;
+        if (!(await markSeen(sb.entities, 'admin-notice', key))) {
+            const [earlier] = await sb.entities.conversations.list({
+                partitionKey: binding.channelId,
+                where: [
+                    { field: 'origin', op: 'eq', value: 'admin_notice' },
+                    { field: 'createdAt', op: 'ge', value: day },
+                ],
+            });
+            const rootId = earlier?.value.rootId;
+            return value({
+                posted: false,
+                reason: 'the admins of this channel were already notified today; nothing was posted',
+                ...(rootId
+                    ? { conversation_id: rootId, url: await sb.platform.messageUrl(channel, rootId, rootId) }
+                    : {}),
+            });
+        }
+        const mentions = sb.conversations.adminMentions(binding);
+        try {
+            const { conversation, url } = await sb.conversations.open({
+                binding,
+                text: `📣 **Message for the Switchboard admins**\n\n${input.message}`,
+                mentions,
+                origin: 'admin_notice',
+                originSession: entry.sessionId,
+            });
+            sb.log.info(
+                { channelId: binding.channelId, sessionId: entry.sessionId, admins: mentions.length },
+                'admins notified'
+            );
+            return value({ posted: true, conversation_id: conversation.rootId, url, admins_notified: mentions.length });
+        } catch (error) {
+            // not posted: a later call may try again today
+            await forgetSeen(sb.entities, 'admin-notice', key);
+            throw error;
+        }
     }
 
     /** A thread of the session's channel; anything else (other channels, unknown IDs) is rejected. */

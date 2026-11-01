@@ -184,4 +184,37 @@ describe('several pods on one store', () => {
         await sleep(300);
         assert.equal(notes().length, 1);
     });
+
+    it('posts one admin message per channel and day, whichever pods and sessions call', async () => {
+        const [a, b] = h.instances;
+        assert.ok(a && b);
+        const sessionFor = async (text: string) => {
+            const root = h.message(text);
+            await h.post(root, 0);
+            await eventually(() => h.thread(root.id).some((t) => t.startsWith('Echo:')), 15_000);
+            return [...h.claude.sessions.keys()].at(-1) ?? '';
+        };
+        const call = (sessionId: string) => {
+            const event = h.claude.emit(sessionId, {
+                type: 'agent.custom_tool_use',
+                name: 'notify_admins',
+                input: { message: `From ${sessionId}` },
+            });
+            return {
+                ...event,
+                type: 'agent.custom_tool_use' as const,
+                id: String(event.id),
+                name: 'notify_admins',
+                input: { message: `From ${sessionId}` },
+                processed_at: String(event.processed_at),
+            };
+        };
+        const first = await sessionFor('admin one');
+        const second = await sessionFor('admin two');
+        await Promise.all([a.sb.tools.handle(first, call(first)), b.sb.tools.handle(second, call(second))]);
+        const notices = h.connector.messages.filter((m) =>
+            String(m.activity.text).startsWith('📣 **Message for the Switchboard admins**')
+        );
+        assert.equal(notices.length, 1);
+    });
 });

@@ -18,6 +18,7 @@ export const TOOL_NAMES = [
     'start_new_conversation',
     'convert_to_conversation',
     'wait',
+    'notify_admins',
 ] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
@@ -39,6 +40,9 @@ const description = {
         description: 'Tags other sessions can find the conversation by, such as incident or ticket IDs.',
     },
 } as const;
+
+/** At most this many characters per `notify_admins` message. */
+export const ADMIN_MESSAGE_CHARS = 2_000;
 
 const definitions: Record<ToolName, BetaManagedAgentsCustomToolParams> = {
     send_update: {
@@ -204,6 +208,22 @@ const definitions: Record<ToolName, BetaManagedAgentsCustomToolParams> = {
             required: ['minutes'],
         },
     },
+    notify_admins: {
+        type: 'custom',
+        name: 'notify_admins',
+        description:
+            'Tells the Switchboard admins about something only they can fix (an expired credential, a missing ' +
+            'permission or tool): posts `message` as a new thread in your channel and @mentions them. At most once ' +
+            'per channel and day: a later call that day posts nothing and returns the link to the earlier message. ' +
+            'Returns `posted`, and the `conversation_id` and link of the message.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                message: markdown(`What is wrong and what you need (at most ${ADMIN_MESSAGE_CHARS} characters)`),
+            },
+            required: ['message'],
+        },
+    },
 };
 
 /** The tools added to a session of this kind. Job sessions get all of them, as they can become conversations. */
@@ -239,5 +259,6 @@ export const ToolInputs = {
     start_new_conversation: z.object({ message: Message, briefing: z.string().optional(), ...Description }),
     convert_to_conversation: z.object({ message: Message, ...Description }),
     wait: z.object({ minutes: z.number().positive(), conversation_id: Id.optional() }),
+    notify_admins: z.object({ message: z.string().min(1).max(ADMIN_MESSAGE_CHARS) }),
 } satisfies Record<ToolName, z.ZodType>;
 export type ToolInput<T extends ToolName> = z.infer<(typeof ToolInputs)[T]>;

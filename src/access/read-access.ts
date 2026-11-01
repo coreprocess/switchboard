@@ -1,4 +1,4 @@
-import { type ChannelPlatform, type ChannelRef, type Mention, ReadAccessError } from '../core/platform.ts';
+import { type ChannelPlatform, type ChannelRef, ReadAccessError } from '../core/platform.ts';
 import { formatLocal } from '../core/time.ts';
 import { type Binding, type ChannelAccess, forgetSeen, markSeen, type Versioned } from '../store/entities.ts';
 import type { Switchboard } from '../switchboard.ts';
@@ -121,7 +121,7 @@ export class ReadAccess {
             const { conversation } = await sb.conversations.open({
                 binding,
                 text,
-                mentions: this.#admins(binding),
+                mentions: sb.conversations.adminMentions(binding),
                 origin: 'notice',
             });
             await sb.entities.access.modify(binding.teamId, binding.channelId, (current) =>
@@ -133,14 +133,6 @@ export class ReadAccess {
             await forgetSeen(sb.entities, 'access-warning', key);
             throw error;
         }
-    }
-
-    /** The admins of the binding's tenant, notified with the warning. */
-    #admins(binding: Binding): Mention[] {
-        const tenant = binding.tenantId.toLowerCase();
-        return this.#sb.settings.admins
-            .filter((admin) => admin.tenant.toLowerCase() === tenant)
-            .map((admin) => ({ id: admin.objectId, name: admin.label ?? 'Switchboard admin' }));
     }
 
     /** Reading works: after a denial, the pod that records the change says so in the latest warning thread. */

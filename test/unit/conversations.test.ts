@@ -41,6 +41,7 @@ describe('conversations', () => {
             'send_to_conversation',
             'start_new_conversation',
             'wait',
+            'notify_admins',
         ]);
         assert.equal(request.environment_id, 'env_test');
         assert.deepEqual(request.vault_ids, ['vlt_test']);

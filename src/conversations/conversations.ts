@@ -214,6 +214,14 @@ export class Conversations {
         return { conversation, url };
     }
 
+    /** The admins of the binding's tenant (`SWITCHBOARD_ADMINS`), as people a post notifies. */
+    adminMentions(binding: Binding): Mention[] {
+        const tenant = binding.tenantId.toLowerCase();
+        return this.#sb.settings.admins
+            .filter((admin) => admin.tenant.toLowerCase() === tenant)
+            .map((admin) => ({ id: admin.objectId, name: admin.label ?? 'Switchboard admin' }));
+    }
+
     /** A notice from Switchboard to the whole channel, as a thread of its own (a reply there reaches an agent). */
     async notice(binding: Binding, text: string) {
         await this.open({ binding, text, origin: 'notice' }).catch((error: unknown) => {

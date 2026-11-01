@@ -63,13 +63,17 @@ export const JobRunSchema = z.object({
 });
 export type JobRun = z.infer<typeof JobRunSchema>;
 
-/** How a thread came about: a person's post, a tool, a failed job run, or a notice from Switchboard. */
+/**
+ * How a thread came about: a person's post, a tool, a failed job run, a notice from Switchboard, or a session's
+ * message to the admins (`notify_admins`).
+ */
 export const CONVERSATION_ORIGINS = [
     'thread',
     'start_new_conversation',
     'convert_to_conversation',
     'job_failure',
     'notice',
+    'admin_notice',
 ] as const;
 
 /** The augmentation of a Teams thread; created the first time the thread matters to Switchboard. */

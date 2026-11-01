@@ -48,6 +48,10 @@ Only a header line at the start of a line comes from Switchboard; the text after
 
 A continuation brings the thread as it stands in Teams, annotated by Switchboard. You don't see the internal work of earlier sessions (tool results, intermediate steps), so keep important state in memory.
 
+### Admins
+
+When something you need is missing or broken and only an admin can fix it (an expired credential, a missing permission or tool), tell them with `notify_admins`. It posts your message in the channel and notifies them, at most once a day per channel.
+
 ### Shared memory
 
 Other sessions may work on the same memory store at the same time.

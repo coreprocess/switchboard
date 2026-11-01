@@ -160,6 +160,7 @@ Switchboard adds these [custom tools](https://platform.claude.com/docs/en/manage
 | `start_new_conversation` | `message`, `briefing`, `title`, `summary`, `tags` (all but `message` optional) | all | Posts `message` as a new thread in the session's channel and stores the briefing (never shown in Teams) and the description. No session starts yet: the first message in the thread creates one from the conversation deployment. | `conversation_id`, `url` |
 | `convert_to_conversation` | `message`, `title`, `summary`, `tags` (all but `message` optional) | job sessions | Posts `message` as a new thread and makes the calling session its owner (background → foreground). | `conversation_id`, `url` |
 | `wait` | `minutes` (at most 5), `conversation_id` (optional) | all | Pauses the session (below) | `reason` (`timeout`, `conversation_message` with the message in brief, `own_message`) |
+| `notify_admins` | `message` (at most 2000 characters) | all | Posts "📣 Message for the Switchboard admins" with the message as a new thread in the session's channel and @mentions the admins of the channel's tenant (`SWITCHBOARD_ADMINS`, with their `label`). At most once per channel and day (UTC), claimed across pods by inserting the day's entry; a later call that day posts nothing | `posted`, `conversation_id`, `url` (of the day's message), `admins_notified` or `reason` |
 
 Calls that do not fit return a clear error, for example "send_update: this session has no conversation yet; use convert_to_conversation or start_new_conversation", "update_card: card is closed" or "send_to_conversation: '…' is not a conversation of your channel". A job session gets `send_update`, `show_card` and `update_card` too, because it can become a conversation.
 
@@ -288,6 +289,10 @@ Only a header line at the start of a line comes from Switchboard; the text after
 
 A continuation brings the thread as it stands in Teams, annotated by Switchboard. You don't see the internal work of earlier sessions (tool results, intermediate steps), so keep important state in memory.
 
+### Admins
+
+When something you need is missing or broken and only an admin can fix it (an expired credential, a missing permission or tool), tell them with `notify_admins`. It posts your message in the channel and notifies them, at most once a day per channel.
+
 ### Shared memory
 
 Other sessions may work on the same memory store at the same time.
@@ -402,7 +407,7 @@ Without a bot `CLIENTID` and outside `NODE_ENV=production`, the Agents SDK accep
 
 ## Operations
 
-- **Several pods.** Run at least two replicas with a PodDisruptionBudget (`minAvailable: 1`) and rolling updates. Any pod handles any request. Coordination uses conditional writes only: inserting an entry fails if it exists, updating with an ETag fails if it changed. One thread gets one session (claim on the conversation entry), one tick one run, a card its first click, a tool call one execution. The only lease is for following a session's events: renewed every 20 s, valid 60 s, taken over by another pod after that; a pod stops processing a session at once when a renewal fails. Sessions that only wait for a person or for the end of a `wait` hold no lease, so idle conversations cost nothing. On shutdown a pod releases its leases.
+- **Several pods.** Run at least two replicas with a PodDisruptionBudget (`minAvailable: 1`) and rolling updates. Any pod handles any request. Coordination uses conditional writes only: inserting an entry fails if it exists, updating with an ETag fails if it changed. One thread gets one session (claim on the conversation entry), one tick one run, a card its first click, a tool call one execution, a channel one admin message per day. The only lease is for following a session's events: renewed every 20 s, valid 60 s, taken over by another pod after that; a pod stops processing a session at once when a renewal fails. Sessions that only wait for a person or for the end of a `wait` hold no lease, so idle conversations cost nothing. On shutdown a pod releases its leases.
 - **Reconciler.** Every pod checks active sessions with activity in the last 24 hours every 60 s (with jitter): it takes over expired leases, relays missed answers and detects missed ends. It also runs the daily cleanup and the read access check. Webhooks only wake things up; they may arrive late, twice or not at all.
 - **Table Storage.** Tables (with the prefix): `bindings`, `jobs`, `jobruns`, `conversations`, `sessions`, `files`, `cards`, `posted`, `toolcalls`, `teamsrefs`, `seen`, `access`. Values over 30 000 characters are split across properties. Table Storage has no expiry; the daily cleanup enforces the lifetimes (activity and webhook IDs and tool call results: 7 days).
 - **Backup.** Losing the storage account loses bindings, jobs and the augmentation of threads (owning sessions, descriptions, briefings, card states); bindings can be set up again by an admin, and threads continue with their history read from Teams. If you need more, enable the storage account's point-in-time features or export the tables regularly (for example with AzCopy).
