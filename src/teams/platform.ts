@@ -272,34 +272,42 @@ export class TeamsPlatform implements ChannelPlatform {
         // Teams message IDs are numbers; anything else (other platforms' IDs, dot segments) is no thread here
         if (!MESSAGE_ID.test(rootId)) return undefined;
         const { scope, ref } = await this.#channelScope(channel);
+        const thread = `${scope}/messages/${encodeURIComponent(rootId)}`;
+        let root: GraphMessage;
         try {
-            const root = await this.#graph.message(
-                scope,
-                `${scope}/messages/${encodeURIComponent(rootId)}?$expand=replies`
-            );
-            return isMessage(root) && root.id === rootId ? this.#summary(ref, channel, root) : undefined;
+            root = await this.#graph.message(scope, thread);
         } catch (error) {
             if (error instanceof GraphError && (error.status === 404 || error.status === 400)) return undefined;
             throw error;
         }
+        if (!isMessage(root) || root.id !== rootId) return undefined;
+        // Graph expands replies only when listing threads; one message's replies come from their own endpoint
+        const { replies } = await this.#replies(scope, thread, Number.POSITIVE_INFINITY);
+        return this.#summary(ref, channel, { ...root, replies });
     }
 
     async readThread(channel: ChannelRef, rootId: string, limit: number) {
         const { scope } = await this.#channelScope(channel);
         const thread = `${scope}/messages/${encodeURIComponent(rootId)}`;
         const root = await this.#graph.message(scope, thread);
-        const replies: GraphMessage[] = [];
-        let next: string | undefined = `${thread}/replies?$top=${REPLIES_PER_PAGE}`;
-        while (next && replies.length < limit * 2) {
-            const page = await this.#graph.page(scope, next);
-            replies.push(...page.value);
-            next = page['@odata.nextLink'] ?? undefined;
-        }
+        const { replies, more } = await this.#replies(scope, thread, limit * 2);
         const messages: ThreadMessage[] = [root, ...replies]
             .filter(isMessage)
             .sort((a, b) => a.createdDateTime.localeCompare(b.createdDateTime))
             .map(toThreadMessage);
-        return { messages: messages.slice(-limit), truncated: messages.length > limit || next !== undefined };
+        return { messages: messages.slice(-limit), truncated: messages.length > limit || more };
+    }
+
+    /** A thread's replies, page by page until at least `max` are read; `more` when Graph has further pages. */
+    async #replies(scope: string, thread: string, max: number): Promise<{ replies: GraphMessage[]; more: boolean }> {
+        const replies: GraphMessage[] = [];
+        let next: string | undefined = `${thread}/replies?$top=${REPLIES_PER_PAGE}`;
+        while (next && replies.length < max) {
+            const page = await this.#graph.page(scope, next);
+            replies.push(...page.value);
+            next = page['@odata.nextLink'] ?? undefined;
+        }
+        return { replies, more: next !== undefined };
     }
 
     async fetchImage(channel: ChannelRef, image: ImageRef) {

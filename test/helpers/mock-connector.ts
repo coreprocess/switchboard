@@ -229,7 +229,15 @@ export class MockConnector {
         const root = thread.find((m) => m.id === rootId);
         if (!root) return void res.status(404).json({ error: { code: 'NotFound' } });
         const replies = thread.filter((m) => m.id !== rootId).map((m) => this.#graphMessage(m));
-        if (rest.length === 0) return void res.json(this.#graphMessage(root, replies));
+        if (rest.length === 0) {
+            // like Graph: replies are expanded only when listing threads
+            if (req.query.$expand) {
+                return void res.status(400).json({
+                    error: { code: 'BadRequest', message: "Expand query parameter 'replies' is not supported" },
+                });
+            }
+            return void res.json(this.#graphMessage(root));
+        }
         if (rest[0] === 'replies') return void res.json(page(replies, Number(req.query.$top ?? GRAPH_PAGE)));
         const hosted = rest[0] === 'hostedContents' ? this.hostedContents.get(rest[1] ?? '') : undefined;
         if (!hosted) return void res.status(404).json({ error: { code: 'NotFound' } });
