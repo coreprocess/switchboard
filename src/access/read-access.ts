@@ -58,17 +58,18 @@ export class ReadAccess {
         for (const { value: binding } of await sb.entities.bindings.list()) await this.check(binding);
     }
 
-    /** Checks one channel; when the platform cannot tell (an outage), nothing changes. */
-    async check(binding: Binding) {
+    /** Checks one channel (also for `status`); when the platform cannot tell (an outage), nothing changes. */
+    async check(binding: Binding): Promise<'readable' | 'denied' | 'unknown'> {
         const sb = this.#sb;
         let readable: boolean;
         try {
             readable = await this.#platform.canRead({ teamId: binding.teamId, channelId: binding.channelId });
         } catch (error) {
             sb.log.warn({ err: error, channelId: binding.channelId }, 'read access not checked');
-            return;
+            return 'unknown';
         }
         await (readable ? this.#readable(binding) : this.#denied(binding));
+        return readable ? 'readable' : 'denied';
     }
 
     /** The platform refused a read in the channel. */

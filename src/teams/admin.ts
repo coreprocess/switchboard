@@ -256,13 +256,20 @@ export class ChannelAdmin {
         }
     }
 
-    /** The channel's read access as last checked (README: "Read access"). */
+    /**
+     * The channel's read access (README: "Read access"), checked on the spot like the regular check: a restored
+     * access gets its note at once. When the check fails, the last known state shows.
+     */
     async #readAccess(binding: Binding): Promise<string> {
         const sb = this.#sb;
         const zone = sb.settings.defaultTimezone;
+        const outcome = await sb.access.check(binding);
         const access = await sb.access.state(binding);
-        if (!access) return 'Read access: not checked yet';
-        const checked = `checked ${formatLocal(new Date(access.checkedAt), zone)}`;
+        if (!access) return 'Read access: unknown (the check failed just now)';
+        const checked =
+            outcome === 'unknown'
+                ? `last checked ${formatLocal(new Date(access.checkedAt), zone)}; the check failed just now`
+                : 'checked just now';
         if (access.readable) return `Read access: ✅ (${checked})`;
         const since = access.deniedSince ? ` since ${formatLocal(new Date(access.deniedSince), zone)}` : '';
         return `⚠️ Read access: denied${since} (${checked}); messages without @Switchboard do not reach the agents`;

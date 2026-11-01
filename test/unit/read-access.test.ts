@@ -55,7 +55,7 @@ describe('read access', () => {
     it('records that reading works, and status shows it', async () => {
         await sb().access.periodic();
         assert.equal((await sb().access.state(await binding()))?.readable, true);
-        assert.match(await status(), /- Read access: ✅ \(checked /);
+        assert.match(await status(), /- Read access: ✅ \(checked just now\)/);
         assert.equal(warnings().length, 0);
     });
 
@@ -82,7 +82,11 @@ describe('read access', () => {
         const state = await sb().access.state(await binding());
         assert.equal(state?.readable, false);
         assert.equal(state?.warningRootId, warnings()[0]?.id);
-        assert.match(await status(), /⚠️ Read access: denied since .* messages without @Switchboard do not reach/);
+        assert.match(
+            await status(),
+            /⚠️ Read access: denied since .* \(checked just now\); messages without @Switchboard do not reach/
+        );
+        assert.equal(warnings().length, 1, 'status posts no second warning');
     });
 
     it('warns at most once a day; agents get a clear error instead', async () => {
@@ -104,25 +108,25 @@ describe('read access', () => {
         assert.equal((await sb().access.state(await binding()))?.warningRootId, warnings()[1]?.id);
     });
 
-    it('says so once in the latest warning thread when reading works again', async () => {
+    it('says so once in the latest warning thread when reading works again, at once on status', async () => {
         h.connector.graphDenied = false;
-        offset += 15 * MINUTE;
-        await sb().access.periodic();
+        offset += 5 * MINUTE;
+        assert.match(await status(), /- Read access: ✅ \(checked just now\)/);
         assert.equal(notes().length, 1);
         assert.equal(notes()[0]?.conversationId, `${CHANNEL};messageid=${warnings()[1]?.id}`);
         offset += 15 * MINUTE;
         await sb().access.periodic();
-        assert.equal(notes().length, 1);
+        assert.equal(await status().then(() => notes().length), 1);
         const state = await sb().access.state(await binding());
         assert.equal(state?.readable, true);
         assert.equal(state?.deniedSince, undefined);
-        assert.match(await status(), /- Read access: ✅/);
     });
 
     it('keeps the last state when the platform cannot tell (an outage)', async () => {
         h.connector.graphDown = true;
         offset += 15 * MINUTE;
         await sb().access.periodic();
+        assert.match(await status(), /- Read access: ✅ \(last checked .*; the check failed just now\)/);
         h.connector.graphDown = false;
         assert.equal((await sb().access.state(await binding()))?.readable, true);
         assert.equal(warnings().length, 2);

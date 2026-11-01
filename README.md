@@ -215,7 +215,7 @@ Teams can withdraw the team's consent to `ChannelMessage.Read.Group` while the a
 - **Warning:** while reading is refused, Switchboard opens a thread in the channel that says since when, what it affects and how to fix it, and @mentions the admins of the channel's tenant from `SWITCHBOARD_ADMINS` (with their `label`). It repeats the warning at most once per channel and day (the first pod to record the day posts it).
 - **Restored:** the first check that can read again posts a note in the latest warning thread, once.
 - **Agents** get an error saying that reading is refused and the admins were notified, instead of a bare HTTP status; a continuation's note in the thread says why the history is missing.
-- `status` shows the last check: readable, or refused since when.
+- **`status`** checks on the spot, like the regular check (so a restored access gets its note at once, and a refusal its warning unless one was posted that day), and shows readable or refused since when. When the check fails, it shows the last known state and when it was checked.
 
 ### Attachments
 
