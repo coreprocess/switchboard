@@ -2,11 +2,17 @@ import { APIError } from '@anthropic-ai/sdk';
 import { CardError } from '../cards/cards.ts';
 import type { SessionEvent } from '../claude/api.ts';
 import { channelOf } from '../conversations/conversations.ts';
+import { ReadAccessError } from '../core/platform.ts';
 import { clip } from '../core/text.ts';
 import type { ToolCall } from '../store/entities.ts';
 import type { Switchboard } from '../switchboard.ts';
 import { isToolName } from './definitions.ts';
 import { ToolFailure, ToolHandlers, type WaitRequest } from './handlers.ts';
+
+const READ_ACCESS_DENIED =
+    'Switchboard is currently not allowed to read this channel’s messages. Switchboard has warned the channel ' +
+    'and notified its admins, so there is no need to report it. Posting (your answers, send_update, ' +
+    'start_new_conversation) still works.';
 
 /** A tool's answer: text for the agent, with the error flag on failure. */
 interface ToolResult {
@@ -146,6 +152,10 @@ export class Tools {
         } catch (error) {
             if (error instanceof ToolFailure || error instanceof CardError) {
                 return { text: `${name}: ${error.message}`, isError: true };
+            }
+            if (error instanceof ReadAccessError) {
+                sb.log.info({ sessionId, tool: name }, 'tool call refused: no read access');
+                return { text: `${name} failed: ${READ_ACCESS_DENIED}`, isError: true };
             }
             sb.log.warn({ err: error, sessionId, tool: name }, 'tool call failed');
             const message = error instanceof Error ? clip(error.message, 300) : 'unknown error';

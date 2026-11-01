@@ -64,7 +64,7 @@ Commands are messages that @mention Switchboard and consist only of the command 
 | Command | Who | Effect |
 |---|---|---|
 | `settings` | admin | Posts the settings card |
-| `status` | everyone | Binding, conversation and job deployment (name, ID, agent version used, hint when the agent has a newer version), the job (schedule, on/off, last run with its result or the start of a running one, next run), the number of conversations with an owning session, known channel limitations, and a hint to `upgrade` when an agent has a newer version |
+| `status` | everyone | Binding, conversation and job deployment (name, ID, agent version used, hint when the agent has a newer version), the job (schedule, on/off, last run with its result or the start of a running one, next run), the number of conversations with an owning session, read access (see [Read access](#read-access)), known channel limitations, and a hint to `upgrade` when an agent has a newer version |
 | `pause` / `resume` | admin | Turns the job off or on |
 | `run` | admin | Starts a job run now (under the one-at-a-time rule) |
 | `upgrade` | admin | Moves the channel's deployments to the newest agent versions (below) |
@@ -206,6 +206,17 @@ The history goes inline up to `HISTORY_INLINE_LIMIT_KB`; a larger one is uploade
 
 **Graph unavailable:** a continuation starts without history (with a line saying so, and a short note in the thread); `list_conversations` and `read_conversation` return an error.
 
+### Read access
+
+Teams can withdraw the team's consent to `ChannelMessage.Read.Group` while the app stays installed, for example when the app is updated in place. Posting and @mentions keep working, but messages without a mention no longer arrive and Graph refuses every read. Nothing fails loudly, so Switchboard checks:
+
+- **Regularly:** every 15 minutes one pod (claimed per interval) reads the latest thread of each bound channel. An outage (anything other than a refusal) changes nothing.
+- **On every refused read:** a tool call or history read that Graph refuses counts as a check.
+- **Warning:** while reading is refused, Switchboard opens a thread in the channel that says since when, what it affects and how to fix it, and @mentions the admins of the channel's tenant from `SWITCHBOARD_ADMINS` (with their `label`). It repeats the warning at most once per channel and day (the first pod to record the day posts it).
+- **Restored:** the first check that can read again posts a note in the latest warning thread, once.
+- **Agents** get an error saying that reading is refused and the admins were notified, instead of a bare HTTP status; a continuation's note in the thread says why the history is missing.
+- `status` shows the last check: readable, or refused since when.
+
 ### Attachments
 
 Images (JPEG, PNG, GIF, WebP) pasted into a message are fetched with the bot's token, scaled down when they exceed Claude's limits (5 MB, 8000 px), uploaded to the binding's workspace and passed on as `image` blocks after the text. Other attachment types are named in a line for the agent and once in the thread. The pipeline has one handler per type (`ATTACHMENT_TYPES`), so documents and other files can be added without changing the data model or message formats. Attachments are never logged; uploaded files are deleted with their conversation's augmentation.
@@ -338,13 +349,13 @@ The endpoint must be reachable over public HTTPS: the Bot Framework and Claude w
 
 ### 6. Teams app
 
-Build the app package with the bot's app ID and upload it (Teams → Apps → Manage your apps → Upload an app), then add it to the team:
+Build the app package with the bot's app ID and upload it into the team (**Manage team → Apps → Upload a custom app**, then **Add** and accept the permissions); an app uploaded elsewhere and added later may get only @mentions:
 
 ```bash
 pnpm teams-app --bot-id <app id>          # writes teams-app/build/switchboard.zip
 ```
 
-The manifest ([`teams-app/manifest.template.json`](teams-app/manifest.template.json)) installs the bot in team scope with the resource-specific permission `ChannelMessage.Read.Group`: the bot receives every channel message without a mention and can read threads through Graph. A team owner grants it at install. The command list (`settings`, `status`, `pause`, `resume`, `run`, `upgrade`, `disconnect`) appears in the compose box.
+The manifest ([`teams-app/manifest.template.json`](teams-app/manifest.template.json)) installs the bot in team scope with the resource-specific permission `ChannelMessage.Read.Group`: the bot receives every channel message without a mention and can read threads through Graph. A team owner grants it at install. **Install updates** of the app the same way: remove it from the team, then upload it into the team (**Manage team → Apps → Upload a custom app**) and accept the permissions; an in-place update can lose the consent, which Switchboard then reports (see [Read access](#read-access)). The command list (`settings`, `status`, `pause`, `resume`, `run`, `upgrade`, `disconnect`) appears in the compose box.
 
 ### 7. Bind a channel
 
@@ -392,8 +403,8 @@ Without a bot `CLIENTID` and outside `NODE_ENV=production`, the Agents SDK accep
 ## Operations
 
 - **Several pods.** Run at least two replicas with a PodDisruptionBudget (`minAvailable: 1`) and rolling updates. Any pod handles any request. Coordination uses conditional writes only: inserting an entry fails if it exists, updating with an ETag fails if it changed. One thread gets one session (claim on the conversation entry), one tick one run, a card its first click, a tool call one execution. The only lease is for following a session's events: renewed every 20 s, valid 60 s, taken over by another pod after that; a pod stops processing a session at once when a renewal fails. Sessions that only wait for a person or for the end of a `wait` hold no lease, so idle conversations cost nothing. On shutdown a pod releases its leases.
-- **Reconciler.** Every pod checks active sessions with activity in the last 24 hours every 60 s (with jitter): it takes over expired leases, relays missed answers and detects missed ends. Webhooks only wake things up; they may arrive late, twice or not at all.
-- **Table Storage.** Tables (with the prefix): `bindings`, `jobs`, `jobruns`, `conversations`, `sessions`, `files`, `cards`, `posted`, `toolcalls`, `teamsrefs`, `seen`. Values over 30 000 characters are split across properties. Table Storage has no expiry; the daily cleanup enforces the lifetimes (activity and webhook IDs and tool call results: 7 days).
+- **Reconciler.** Every pod checks active sessions with activity in the last 24 hours every 60 s (with jitter): it takes over expired leases, relays missed answers and detects missed ends. It also runs the daily cleanup and the read access check. Webhooks only wake things up; they may arrive late, twice or not at all.
+- **Table Storage.** Tables (with the prefix): `bindings`, `jobs`, `jobruns`, `conversations`, `sessions`, `files`, `cards`, `posted`, `toolcalls`, `teamsrefs`, `seen`, `access`. Values over 30 000 characters are split across properties. Table Storage has no expiry; the daily cleanup enforces the lifetimes (activity and webhook IDs and tool call results: 7 days).
 - **Backup.** Losing the storage account loses bindings, jobs and the augmentation of threads (owning sessions, descriptions, briefings, card states); bindings can be set up again by an admin, and threads continue with their history read from Teams. If you need more, enable the storage account's point-in-time features or export the tables regularly (for example with AzCopy).
 - **Scale.** At dozens of pods or thousands of active sessions, a coordination store such as Redis could be added behind the `Store` interface; it is not part of v1.
 

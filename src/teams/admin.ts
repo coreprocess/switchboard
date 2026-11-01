@@ -212,6 +212,7 @@ export class ChannelAdmin {
         const sb = this.#sb;
         await sb.jobs.remove(binding.channelId);
         await sb.entities.bindings.delete(binding.teamId, binding.channelId);
+        await sb.access.forget(binding);
         const sessions = await sb.entities.sessions.list({
             where: [
                 { field: 'channelId', op: 'eq', value: binding.channelId },
@@ -255,7 +256,19 @@ export class ChannelAdmin {
         }
     }
 
-    /** `status`: binding, deployments, job, active conversations, known limitations. */
+    /** The channel's read access as last checked (README: "Read access"). */
+    async #readAccess(binding: Binding): Promise<string> {
+        const sb = this.#sb;
+        const zone = sb.settings.defaultTimezone;
+        const access = await sb.access.state(binding);
+        if (!access) return 'Read access: not checked yet';
+        const checked = `checked ${formatLocal(new Date(access.checkedAt), zone)}`;
+        if (access.readable) return `Read access: ✅ (${checked})`;
+        const since = access.deniedSince ? ` since ${formatLocal(new Date(access.deniedSince), zone)}` : '';
+        return `⚠️ Read access: denied${since} (${checked}); messages without @Switchboard do not reach the agents`;
+    }
+
+    /** `status`: binding, deployments, job, active conversations, read access, known limitations. */
     async status(channel: ChannelContext): Promise<string> {
         const sb = this.#sb;
         const binding = await this.binding(channel);
@@ -286,6 +299,7 @@ export class ChannelAdmin {
             where: [{ field: 'owningSession', op: 'gt', value: '' }],
         });
         lines.push(`- Conversations with an active session: ${owned.length}`);
+        lines.push(`- ${await this.#readAccess(binding)}`);
         if (conversationDeployment.outdated || jobDeployment?.outdated) {
             lines.push(
                 '- Newer agent versions exist: an admin moves the deployments to them with `@Switchboard upgrade`.'

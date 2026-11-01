@@ -34,6 +34,8 @@ export class MockConnector {
     readonly hostedContents = new Map<string, { type: string; data: Buffer }>();
     /** Graph answers 503 while set. */
     graphDown = false;
+    /** Graph answers 403 while set, as when the team's consent for the app is missing. */
+    graphDenied = false;
     /** Graph requests, as paths. */
     readonly graphRequests: string[] = [];
     now: () => Date = () => new Date();
@@ -193,6 +195,11 @@ export class MockConnector {
     #graph(req: express.Request, res: express.Response) {
         this.graphRequests.push(req.path);
         if (this.graphDown) return void res.status(503).json({ error: { code: 'ServiceUnavailable' } });
+        if (this.graphDenied) {
+            return void res.status(403).json({
+                error: { code: 'Forbidden', message: 'Missing role permissions on the request.' },
+            });
+        }
         const parts = req.path.split('/').filter(Boolean).map(decodeURIComponent);
         const [teams, group, channels, channelId, messages, rootId, ...rest] = parts;
         const team = [...this.teams.values()].find((t) => t.aadGroupId === group);

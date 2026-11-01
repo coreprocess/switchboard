@@ -7,7 +7,15 @@
 /** An Adaptive Card (JSON object with `type: "AdaptiveCard"`). */
 export type CardJson = Record<string, unknown>;
 
-export type OutboundContent = { text: string; card?: undefined } | { card: CardJson; text?: undefined };
+/** A person a message notifies (for Teams: an @mention by Entra object ID). */
+export interface Mention {
+    id: string;
+    name: string;
+}
+
+export type OutboundContent =
+    | { text: string; card?: undefined; mentions?: Mention[] }
+    | { card: CardJson; text?: undefined; mentions?: undefined };
 
 /** A channel: its team and the channel itself. */
 export interface ChannelRef {
@@ -56,6 +64,12 @@ export interface ThreadSummary {
 /** The message Switchboard wanted to change no longer exists in the platform: someone deleted it (or its thread). */
 export class MessageGoneError extends Error {}
 
+/**
+ * The platform does not let Switchboard read the channel: a permission is missing (README: "Read access").
+ * Posting may still work.
+ */
+export class ReadAccessError extends Error {}
+
 /** A cursor the platform did not hand out (agents pass cursors back). */
 export class CursorError extends Error {}
 
@@ -87,4 +101,8 @@ export interface ChannelPlatform {
         limit: number
     ): Promise<{ messages: ThreadMessage[]; truncated: boolean }>;
     fetchImage(channel: ChannelRef, image: ImageRef): Promise<{ data: Uint8Array; mediaType: string }>;
+    /** Whether Switchboard may read the channel; `false` when access is denied, an error when it is unknown. */
+    canRead(channel: ChannelRef): Promise<boolean>;
+    /** What reading being denied means on this platform and how people restore it (Markdown, for warnings). */
+    readonly readAccessHelp: string;
 }

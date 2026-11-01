@@ -6,9 +6,11 @@ import {
     type ChannelRef,
     CursorError,
     type ImageRef,
+    type Mention,
     MessageGoneError,
     type OutboundContent,
     type Page,
+    ReadAccessError,
     type ThreadMessage,
     type ThreadSummary,
 } from '../core/platform.ts';
@@ -36,12 +38,43 @@ export interface TeamsPlatformOptions {
     attachmentHosts?: RegExp[];
 }
 
-export const toActivity = (content: OutboundContent): Activity =>
-    Activity.fromObject(
-        content.card
-            ? { type: 'message', attachments: [{ contentType: ADAPTIVE_CARD, content: content.card }] }
-            : { type: 'message', text: content.text, textFormat: 'markdown' }
-    );
+const READ_ACCESS_HELP = [
+    'Teams no longer grants Switchboard the permission to read this team’s channel messages ' +
+        '(`ChannelMessage.Read.Group`); this happens, for example, when the app is updated in place. Until it is ' +
+        'restored, messages without @Switchboard do not reach the agents, agents cannot list or read threads, and ' +
+        'agents taking over a thread start without its earlier messages.',
+    '',
+    '**To fix it**, a team owner installs the app again: **Manage team → Apps**, remove Switchboard, then ' +
+        '**Upload a custom app** there, choose the app package, select **Add** and accept the permissions.',
+].join('\n');
+
+/** `<at>` tags take plain text; Teams shows it as the mention's label. */
+const atTag = (mention: Mention) => `<at>${mention.name.replace(/[<>&]/g, '')}</at>`;
+
+/** Mentions go on a line of their own at the end; each needs an entity with the person's ID. */
+export const toActivity = (content: OutboundContent): Activity => {
+    if (content.card) {
+        return Activity.fromObject({
+            type: 'message',
+            attachments: [{ contentType: ADAPTIVE_CARD, content: content.card }],
+        });
+    }
+    const mentions = content.mentions ?? [];
+    return Activity.fromObject({
+        type: 'message',
+        text: mentions.length > 0 ? `${content.text}\n\n${mentions.map(atTag).join(' ')}` : content.text,
+        textFormat: 'markdown',
+        ...(mentions.length > 0
+            ? {
+                  entities: mentions.map((mention) => ({
+                      type: 'mention',
+                      text: atTag(mention),
+                      mentioned: { id: mention.id, name: mention.name },
+                  })),
+              }
+            : {}),
+    });
+};
 
 const TeamDetails = z.looseObject({ id: z.string(), name: z.string().nullish(), aadGroupId: z.string().nullish() });
 const TeamChannels = z.looseObject({
@@ -76,6 +109,7 @@ export class TeamsPlatform implements ChannelPlatform {
     readonly #attachmentHosts: RegExp[] | undefined;
     /** `{ aud: <app id> }`, what the adapter derives from the app ID; also valid in anonymous development mode. */
     readonly #identity: ReturnType<typeof CloudAdapter.createIdentity>;
+    readonly readAccessHelp = READ_ACCESS_HELP;
 
     constructor(options: TeamsPlatformOptions) {
         this.#adapter = options.adapter;
@@ -270,6 +304,18 @@ export class TeamsPlatform implements ChannelPlatform {
 
     async fetchImage(channel: ChannelRef, image: ImageRef) {
         return this.#graph.bytes((await this.#channelScope(channel)).scope, image.ref);
+    }
+
+    /** Reads the channel's latest thread, which needs the same permission as every other read. */
+    async canRead(channel: ChannelRef) {
+        const { scope } = await this.#channelScope(channel);
+        try {
+            await this.#graph.page(scope, `${scope}/messages?$top=1`);
+            return true;
+        } catch (error) {
+            if (error instanceof ReadAccessError) return false;
+            throw error;
+        }
     }
 
     // --- Teams specifics: team details, attachments of incoming activities -------------------------------------

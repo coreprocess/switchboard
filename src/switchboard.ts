@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { ReadAccess } from './access/read-access.ts';
 import { Attachments } from './attachments/attachments.ts';
 import { CardService } from './cards/service.ts';
 import type { ClaudeWorkspaces } from './claude/api.ts';
@@ -42,6 +43,8 @@ export interface Timing {
     claimMs: number;
     claimWaitMs: number;
     waitTickMs: number;
+    /** How often one pod checks that Switchboard may read the bound channels. */
+    accessCheckMs: number;
 }
 
 const DEFAULT_TIMING: Timing = {
@@ -53,6 +56,7 @@ const DEFAULT_TIMING: Timing = {
     claimMs: 90_000,
     claimWaitMs: 30_000,
     waitTickMs: 10_000,
+    accessCheckMs: 15 * 60_000,
 };
 
 /** One Switchboard instance (pod): the shared parts and the services, which reach each other through it. */
@@ -79,13 +83,15 @@ export class Switchboard {
     readonly jobs: Jobs;
     readonly lifecycle: Lifecycle;
     readonly reconciler: Reconciler;
+    readonly access: ReadAccess;
 
     constructor(core: Core) {
         this.settings = core.settings;
         this.entities = core.entities;
         this.workspaces = core.workspaces;
         this.templates = core.templates;
-        this.platform = core.platform;
+        this.access = new ReadAccess(this, core.platform);
+        this.platform = this.access.watch();
         this.log = core.log;
         this.podId = core.podId ?? `pod-${randomUUID()}`;
         this.timing = { ...DEFAULT_TIMING, ...core.timing };
@@ -109,7 +115,10 @@ export class Switchboard {
         return this.#now();
     }
 
-    /** Starts the background loops: reconciler (which also runs the daily cleanup), job scheduler, wait timer. */
+    /**
+     * Starts the background loops: reconciler (which also runs the daily cleanup and the read access check), job
+     * scheduler, wait timer.
+     */
     start() {
         this.reconciler.start();
         this.jobs.start();

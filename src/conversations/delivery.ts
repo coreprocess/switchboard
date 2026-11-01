@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { APIError } from '@anthropic-ai/sdk';
 import type { IncomingAttachment } from '../attachments/attachments.ts';
 import type { ContentBlock, FileResource } from '../claude/templates.ts';
+import { ReadAccessError } from '../core/platform.ts';
 import {
     clip,
     continuationHeader,
@@ -330,10 +331,11 @@ export class Delivery {
             };
         } catch (error) {
             sb.log.warn({ err: error, channelId: binding.channelId }, 'thread history not read');
+            const why = error instanceof ReadAccessError ? ' (Switchboard is not allowed to read this channel)' : '';
             await this.#note(
                 binding,
                 conversation.rootId,
-                'ℹ️ The earlier messages of this thread could not be read; the agent starts without them.'
+                `ℹ️ The earlier messages of this thread could not be read${why}; the agent starts without them.`
             );
             const briefing = conversation.briefing
                 ? [`Briefing (not shown in Teams):\n${neutralise(conversation.briefing)}`]

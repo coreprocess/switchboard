@@ -231,6 +231,19 @@ export const TeamsRefSchema = z.object({
 });
 export type TeamsRef = z.infer<typeof TeamsRefSchema>;
 
+/** Whether Switchboard may read a bound channel, as last checked (README: "Read access"). */
+export const ChannelAccessSchema = z.object({
+    teamId: z.string(),
+    channelId: z.string(),
+    readable: z.boolean(),
+    checkedAt: z.string(),
+    /** Since when reading is denied; absent while it works. */
+    deniedSince: optional,
+    /** The latest warning thread, until reading works again. */
+    warningRootId: optional,
+});
+export type ChannelAccess = z.infer<typeof ChannelAccessSchema>;
+
 export const SeenSchema = z.object({ kind: z.string(), id: z.string(), at: z.string() });
 export type Seen = z.infer<typeof SeenSchema>;
 
@@ -337,6 +350,7 @@ export const createEntities = (store: Store) => ({
     files: new Collection(store, 'files', UploadedFileSchema, (f) => [f.owner, f.fileId]),
     teamsRefs: new Collection(store, 'teamsrefs', TeamsRefSchema, (t) => [t.teamId, '']),
     seen: new Collection(store, 'seen', SeenSchema, (s) => [s.kind, s.id]),
+    access: new Collection(store, 'access', ChannelAccessSchema, (a) => [a.teamId, a.channelId]),
 });
 
 export type Entities = ReturnType<typeof createEntities>;

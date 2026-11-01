@@ -8,7 +8,8 @@ const WINDOW_MS = 24 * 60 * 60 * 1000;
 /**
  * Catches up on what streams and webhooks missed (README: "Operations"). Runs on every pod
  * every 60 s with jitter and at start: active sessions with recent activity whose lease is free get followed
- * again when they have something to relay; ends that went unnoticed are handled. Also triggers the daily cleanup.
+ * again when they have something to relay; ends that went unnoticed are handled. Also triggers the daily cleanup
+ * and the read access check.
  */
 export class Reconciler {
     readonly #sb: Switchboard;
@@ -63,6 +64,9 @@ export class Reconciler {
         } catch (error) {
             sb.log.warn({ err: error }, 'reconcile failed');
         }
+        await sb.access.periodic().catch((error: unknown) => {
+            sb.log.warn({ err: error }, 'read access check failed');
+        });
     }
 
     async #check(entry: SessionEntry) {

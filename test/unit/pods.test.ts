@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
-import { CHANNEL, eventually, type Harness, sleep, startHarness, WORKSPACE } from '../helpers/harness.ts';
+import { CHANNEL, eventually, type Harness, sleep, startHarness, TEAM, WORKSPACE } from '../helpers/harness.ts';
 import type { Turn } from '../helpers/mock-claude.ts';
 
 describe('several pods on one store', () => {
@@ -160,5 +160,28 @@ describe('several pods on one store', () => {
         await eventually(() => h.thread(root.id).includes('Echo: which pod?'));
         await h.post(h.message('reply via the other pod', { rootId: root.id }), 0);
         await eventually(() => h.thread(root.id).includes('Echo: reply via the other pod'));
+    });
+
+    it('warns once and notes restored read access once, whichever pods see it', async () => {
+        const [a, b] = h.instances;
+        assert.ok(a && b);
+        const channel = { teamId: TEAM, channelId: CHANNEL };
+        const warnings = () =>
+            h.connector.messages.filter((m) => String(m.activity.text).startsWith('⚠️ **Switchboard cannot read'));
+        const notes = () =>
+            h.connector.messages.filter((m) => m.activity.text === '✅ Switchboard can read this channel again.');
+        h.connector.graphDenied = true;
+        try {
+            await Promise.all([a.sb.access.denied(channel), b.sb.access.denied(channel)]);
+            await sleep(300);
+            assert.equal(warnings().length, 1);
+        } finally {
+            h.connector.graphDenied = false;
+        }
+        const binding = (await a.sb.entities.bindings.get(TEAM, CHANNEL))?.value;
+        assert.ok(binding);
+        await Promise.all([a.sb.access.check(binding), b.sb.access.check(binding)]);
+        await sleep(300);
+        assert.equal(notes().length, 1);
     });
 });

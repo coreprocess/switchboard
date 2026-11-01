@@ -16,6 +16,7 @@ export const TABLES = [
     'toolcalls',
     'teamsrefs',
     'seen',
+    'access',
 ] as const;
 
 export type TableName = (typeof TABLES)[number];

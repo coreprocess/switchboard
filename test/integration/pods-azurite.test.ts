@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import { startAzurite } from '../helpers/azurite.ts';
-import { CHANNEL, eventually, type Harness, sleep, startHarness, WORKSPACE } from '../helpers/harness.ts';
+import { CHANNEL, eventually, type Harness, sleep, startHarness, TEAM, WORKSPACE } from '../helpers/harness.ts';
 import type { Turn } from '../helpers/mock-claude.ts';
 
 /** Two Switchboard instances on one Table Storage account (Azurite), against the mock Claude API and connector. */
@@ -139,5 +139,28 @@ describe('two pods on Table Storage (Azurite)', () => {
         await h.post(h.message('after the end', { rootId: root.id }), 1);
         await eventually(() => h.thread(root.id).includes('Echo: after the end'), 15_000);
         assert.match(h.firstText(), /^\[switchboard:continuation\] previous_session=/);
+    });
+
+    it('warns once and notes restored read access once, whichever pods see it', async () => {
+        const [a, b] = h.instances;
+        assert.ok(a && b);
+        const channel = { teamId: TEAM, channelId: CHANNEL };
+        const warnings = () =>
+            h.connector.messages.filter((m) => String(m.activity.text).startsWith('⚠️ **Switchboard cannot read'));
+        const notes = () =>
+            h.connector.messages.filter((m) => m.activity.text === '✅ Switchboard can read this channel again.');
+        h.connector.graphDenied = true;
+        try {
+            await Promise.all([a.sb.access.denied(channel), b.sb.access.denied(channel)]);
+            await sleep(300);
+            assert.equal(warnings().length, 1);
+        } finally {
+            h.connector.graphDenied = false;
+        }
+        const binding = (await a.sb.entities.bindings.get(TEAM, CHANNEL))?.value;
+        assert.ok(binding);
+        await Promise.all([a.sb.access.check(binding), b.sb.access.check(binding)]);
+        await sleep(300);
+        assert.equal(notes().length, 1);
     });
 });

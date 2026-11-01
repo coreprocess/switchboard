@@ -1,5 +1,5 @@
 import { cardText } from '../cards/cards.ts';
-import type { ChannelRef, OutboundContent, ThreadMessage } from '../core/platform.ts';
+import type { ChannelRef, Mention, OutboundContent, ThreadMessage } from '../core/platform.ts';
 import { clip } from '../core/text.ts';
 import type { Binding, Conversation, PostedKind, Versioned } from '../store/entities.ts';
 import type { Switchboard } from '../switchboard.ts';
@@ -19,6 +19,8 @@ export interface Description {
 export interface NewThread {
     binding: Binding;
     text: string;
+    /** People the post notifies. */
+    mentions?: Mention[];
     origin: Conversation['origin'];
     /** The session the new thread belongs to from the start (`convert_to_conversation`, job failures). */
     owningSession?: string;
@@ -183,7 +185,10 @@ export class Conversations {
         const sb = this.#sb;
         const { binding } = thread;
         const channel = channelOf(binding);
-        const { rootId, url } = await sb.platform.postThread(channel, { text: thread.text });
+        const { rootId, url } = await sb.platform.postThread(channel, {
+            text: thread.text,
+            ...(thread.mentions ? { mentions: thread.mentions } : {}),
+        });
         await this.#record(channel, rootId, rootId, {
             kind: 'opening',
             ...(thread.originSession ? { sessionId: thread.originSession } : {}),

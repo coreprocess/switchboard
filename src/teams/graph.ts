@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { CardJson, ImageRef, ThreadMessage } from '../core/platform.ts';
+import { type CardJson, type ImageRef, ReadAccessError, type ThreadMessage } from '../core/platform.ts';
 import { htmlToMarkdown } from './activity.ts';
 
 /**
@@ -143,6 +143,8 @@ export class Graph {
         // without a token only a test endpoint can be reached (anonymous development mode)
         if (!token && this.#base === GRAPH_BASE) throw new Error('no Graph token');
         const response = await fetch(url, { headers: token ? { authorization: `Bearer ${token}` } : {} });
+        // the only reason Graph refuses channel reads to the bot: the team's consent is missing
+        if (response.status === 403) throw new ReadAccessError('Switchboard is not allowed to read this channel');
         if (!response.ok) throw new GraphError(response.status);
         return response;
     }
