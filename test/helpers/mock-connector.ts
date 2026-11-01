@@ -238,7 +238,10 @@ export class MockConnector {
             }
             return void res.json(this.#graphMessage(root));
         }
-        if (rest[0] === 'replies') return void res.json(page(replies, Number(req.query.$top ?? GRAPH_PAGE)));
+        // like Graph: a thread's replies come newest first
+        if (rest[0] === 'replies') {
+            return void res.json(page([...replies].reverse(), Number(req.query.$top ?? GRAPH_PAGE)));
+        }
         const hosted = rest[0] === 'hostedContents' ? this.hostedContents.get(rest[1] ?? '') : undefined;
         if (!hosted) return void res.status(404).json({ error: { code: 'NotFound' } });
         res.type(hosted.type).send(hosted.data);
