@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
-import { Graph, toThreadMessage } from '../../src/teams/graph.ts';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { after, before, describe, it } from 'node:test';
+import { ReadAccessError } from '../../src/core/platform.ts';
+import { Graph, GraphError, toThreadMessage } from '../../src/teams/graph.ts';
 
 const GROUP = '00000000-0000-0000-0000-00000000000a';
 const graph = new Graph(async () => undefined);
@@ -71,5 +74,60 @@ describe('Graph messages', () => {
         });
         assert.deepEqual(message.author, { name: 'Switchboard', isApp: true });
         assert.equal(message.text, 'Done.');
+    });
+});
+
+describe('Graph retries', () => {
+    /** The answers the server gives, in order: a status and its `Retry-After`; then 200 with an empty page. */
+    let answers: { status: number; retryAfter?: string }[] = [];
+    let requests = 0;
+    const server = createServer((_req, res) => {
+        requests++;
+        const answer = answers.shift();
+        if (!answer) return void res.writeHead(200, { 'content-type': 'application/json' }).end('{"value":[]}');
+        res.writeHead(answer.status, answer.retryAfter ? { 'retry-after': answer.retryAfter } : {}).end('{}');
+    });
+    let retrying: Graph;
+    let channel: string;
+
+    before(async () => {
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+        const { port } = server.address() as AddressInfo;
+        retrying = new Graph(async () => 'token', `http://127.0.0.1:${port}/v1.0`, 5);
+        channel = retrying.channelUrl(GROUP, '19:ops-channel@thread.tacv2');
+    });
+
+    after(() => {
+        server.close();
+    });
+
+    const read = (statuses: { status: number; retryAfter?: string }[]) => {
+        answers = [...statuses];
+        requests = 0;
+        return retrying.page(channel, `${channel}/messages`);
+    };
+
+    it('retries throttling and server errors, honouring Retry-After', async () => {
+        const started = Date.now();
+        const page = await read([{ status: 429, retryAfter: '1' }, { status: 503 }, { status: 500 }]);
+        assert.deepEqual(page.value, []);
+        assert.equal(requests, 4);
+        assert.ok(Date.now() - started >= 1_000, 'waited as Graph asked');
+    });
+
+    it('gives up after three retries', async () => {
+        await assert.rejects(read(Array(4).fill({ status: 503 })), (error) => {
+            assert.ok(error instanceof GraphError);
+            assert.equal(error.status, 503);
+            return true;
+        });
+        assert.equal(requests, 4);
+    });
+
+    it('does not retry a refusal or a missing message', async () => {
+        await assert.rejects(read([{ status: 403 }]), ReadAccessError);
+        assert.equal(requests, 1);
+        await assert.rejects(read([{ status: 404 }]), GraphError);
+        assert.equal(requests, 1);
     });
 });

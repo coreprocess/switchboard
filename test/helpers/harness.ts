@@ -147,6 +147,7 @@ export const startHarness = async (options: HarnessOptions = {}) => {
             outboundPolicy: undefined,
             log: log.child({ pod: index }),
             graphBase: connector.graphBase,
+            graphRetryDelayMs: 5,
             attachmentHosts: [/^127\.0\.0\.1$/],
             timing: { ...FAST, ...options.timing },
             podId: `pod-${index}`,

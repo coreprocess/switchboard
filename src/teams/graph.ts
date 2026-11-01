@@ -1,15 +1,23 @@
 import { z } from 'zod';
 import { type CardJson, type ImageRef, ReadAccessError, type ThreadMessage } from '../core/platform.ts';
+import { sleep } from '../core/time.ts';
 import { htmlToMarkdown } from './activity.ts';
 
 /**
  * Reading Teams channels through Microsoft Graph, app-only with the bot's identity and the team's
  * resource-specific consent (`ChannelMessage.Read.Group`). Graph lists a channel's threads by latest activity and
  * has no sorting or filtering of its own; messages come as HTML, cards as attachments, images as hosted contents.
+ * Throttling and server errors are retried a few times (Switchboard only reads, so a retry changes nothing).
  */
 
 export const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 export const GRAPH_SCOPE = 'https://graph.microsoft.com';
+
+/** Graph answers that pass: throttling and server errors. */
+const TRANSIENT = new Set([429, 500, 502, 503, 504]);
+const RETRIES = 3;
+/** A longer `Retry-After` is cut short: an agent waits for the answer. */
+const MAX_RETRY_WAIT_MS = 30_000;
 
 const GraphMessage = z.looseObject({
     id: z.string(),
@@ -110,10 +118,13 @@ export const isMessage = (message: Pick<GraphMessage, 'messageType' | 'deletedDa
 export class Graph {
     readonly #token: () => Promise<string | undefined>;
     readonly #base: string;
+    /** The first wait before a retry when Graph names none; it doubles with each retry. */
+    readonly #retryDelayMs: number;
 
-    constructor(token: () => Promise<string | undefined>, base = GRAPH_BASE) {
+    constructor(token: () => Promise<string | undefined>, base = GRAPH_BASE, retryDelayMs = 1_000) {
         this.#token = token;
         this.#base = base.replace(/\/$/, '');
+        this.#retryDelayMs = retryDelayMs;
     }
 
     /** The Graph URL of a channel; every other URL the bot's token goes to must start with it. */
@@ -139,14 +150,36 @@ export class Graph {
 
     async #fetch(url: string, scope: string): Promise<Response> {
         if (!this.within(scope, url)) throw new Error('Graph URL outside the channel');
-        const token = await this.#token();
-        // without a token only a test endpoint can be reached (anonymous development mode)
-        if (!token && this.#base === GRAPH_BASE) throw new Error('no Graph token');
-        const response = await fetch(url, { headers: token ? { authorization: `Bearer ${token}` } : {} });
-        // the only reason Graph refuses channel reads to the bot: the team's consent is missing
-        if (response.status === 403) throw new ReadAccessError('Switchboard is not allowed to read this channel');
-        if (!response.ok) throw new GraphError(response.status);
-        return response;
+        for (let attempt = 0; ; attempt++) {
+            const retry = attempt < RETRIES;
+            const token = await this.#token();
+            // without a token only a test endpoint can be reached (anonymous development mode)
+            if (!token && this.#base === GRAPH_BASE) throw new Error('no Graph token');
+            let response: Response;
+            try {
+                response = await fetch(url, { headers: token ? { authorization: `Bearer ${token}` } : {} });
+            } catch (error) {
+                if (!retry) throw error;
+                await sleep(this.#wait(attempt, null));
+                continue;
+            }
+            if (retry && TRANSIENT.has(response.status)) {
+                await response.body?.cancel();
+                await sleep(this.#wait(attempt, response.headers.get('retry-after')));
+                continue;
+            }
+            // the only reason Graph refuses channel reads to the bot: the team's consent is missing
+            if (response.status === 403) throw new ReadAccessError('Switchboard is not allowed to read this channel');
+            if (!response.ok) throw new GraphError(response.status);
+            return response;
+        }
+    }
+
+    /** Graph's `Retry-After` (seconds) when it gives one, else a doubling delay. */
+    #wait(attempt: number, retryAfter: string | null): number {
+        const seconds = retryAfter === null ? Number.NaN : Number(retryAfter);
+        const wait = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1_000 : this.#retryDelayMs * 2 ** attempt;
+        return Math.min(wait, MAX_RETRY_WAIT_MS);
     }
 
     async page(scope: string, url: string) {

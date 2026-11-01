@@ -34,6 +34,8 @@ export interface TeamsPlatformOptions {
     botAppId: string;
     /** Microsoft Graph's base URL (tests). */
     graphBase?: string;
+    /** The first wait before Graph retries (tests). */
+    graphRetryDelayMs?: number;
     /** Hosts attachments may be downloaded from (tests); Microsoft's hosts by default, HTTPS only. */
     attachmentHosts?: RegExp[];
 }
@@ -117,7 +119,7 @@ export class TeamsPlatform implements ChannelPlatform {
         this.#botAppId = options.botAppId;
         this.#attachmentHosts = options.attachmentHosts;
         this.#identity = CloudAdapter.createIdentity(options.botAppId);
-        this.#graph = new Graph(() => this.token(GRAPH_SCOPE), options.graphBase);
+        this.#graph = new Graph(() => this.token(GRAPH_SCOPE), options.graphBase, options.graphRetryDelayMs);
     }
 
     /** A token of the bot's app registration (workload identity); `undefined` in anonymous development mode. */

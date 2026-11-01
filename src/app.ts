@@ -20,8 +20,9 @@ export interface AppOptions {
     /** Restricts the hosts the bot calls; the Microsoft default list in production. */
     outboundPolicy: OutboundUrlPolicy | undefined;
     log: Logger;
-    /** Tests: Microsoft Graph's base URL, attachment hosts, timings, clock, pod ID. */
+    /** Tests: Microsoft Graph's base URL and retry delay, attachment hosts, timings, clock, pod ID. */
     graphBase?: string;
+    graphRetryDelayMs?: number;
     attachmentHosts?: RegExp[];
     timing?: Partial<Timing>;
     now?: () => Date;
@@ -41,6 +42,7 @@ export const createApp = (options: AppOptions) => {
         entities,
         botAppId: options.authConfig.clientId ?? '',
         ...(options.graphBase ? { graphBase: options.graphBase } : {}),
+        ...(options.graphRetryDelayMs !== undefined ? { graphRetryDelayMs: options.graphRetryDelayMs } : {}),
         ...(options.attachmentHosts ? { attachmentHosts: options.attachmentHosts } : {}),
     });
     const core: Core = {

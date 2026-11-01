@@ -204,7 +204,7 @@ When a thread's session has ended, or a thread that already has content gets its
 
 The history goes inline up to `HISTORY_INLINE_LIMIT_KB`; a larger one is uploaded to the workspace's Files API and mounted read-only at `/mnt/session/uploads/switchboard/conversation-history.md`, and the message carries the latest 20 entries and the path. The images of the latest 10 messages are fetched from Graph and come along as image blocks; older ones appear as `[image: …]` markers. Entries are indented, so no line of a history can look like a header. Edits and deletions show up in later histories as they are. The new session does not see the earlier sessions' internal work (tool results, intermediate steps); agents keep important state in memory.
 
-**Graph unavailable:** a continuation starts without history (with a line saying so, and a short note in the thread); `list_conversations` and `read_conversation` return an error.
+**Graph unavailable:** throttling (429) and server errors (5xx) are retried up to three times, waiting as long as Graph's `Retry-After` says (at most 30 s) or 1, 2 and 4 s. If Graph stays unavailable, a continuation starts without history (with a line saying so, and a short note in the thread); `list_conversations` and `read_conversation` return an error.
 
 ### Read access
 
