@@ -19,6 +19,11 @@ describe('several pods on one store', () => {
                 turn.say('Finally done.');
                 return;
             }
+            if (last === 'wait for me') {
+                const waited = await turn.callTool('wait', { minutes: 1 });
+                turn.say(`Waited: ${waited.text}`);
+                return;
+            }
             turn.say(`Echo: ${last}`);
         };
         await h.bind({ job_deployment: `${WORKSPACE}|depl_job`, job_cron: '* * * * *', job_enabled: 'false' });
@@ -152,6 +157,34 @@ describe('several pods on one store', () => {
         await sleep(300);
         assert.equal(results(watched).length, 1, 'a wait ended by a message is answered once');
         assert.match(String(JSON.stringify(results(watched)[0]?.content)), /conversation_message/);
+    });
+
+    it('ends a wait once and passes the messages on when replies reach both pods', async () => {
+        const [a] = h.instances;
+        assert.ok(a);
+        const root = h.message('wait for me');
+        await h.post(root, 0);
+        const sessionId = async () => (await a.sb.conversations.get(CHANNEL, root.id))?.owningSession ?? '';
+        const waits = async () =>
+            (await a.sb.entities.toolCalls.list({ partitionKey: await sessionId() })).filter(
+                (call) => call.value.tool === 'wait'
+            );
+        await eventually(async () => (await waits()).some((call) => call.value.status === 'waiting'));
+        await Promise.all([
+            h.post(h.message('Reply on pod 0', { rootId: root.id }), 0),
+            h.post(h.message('Reply on pod 1', { rootId: root.id }), 1),
+        ]);
+        await eventually(() => h.thread(root.id).some((text) => text.startsWith('Waited: ')));
+        assert.ok(h.thread(root.id).some((text) => text.includes('own_message')));
+        const id = await sessionId();
+        await eventually(() => {
+            const received = h.claude.userMessages(id).join('\n');
+            return received.includes('Reply on pod 0') && received.includes('Reply on pod 1');
+        });
+        await sleep(300);
+        const answers = (h.claude.sessions.get(id)?.events ?? []).filter((e) => e.type === 'user.custom_tool_result');
+        assert.equal(answers.length, 1, 'the wait is answered once');
+        assert.equal((await waits()).length, 1);
     });
 
     it('accepts card clicks and replies on any pod', async () => {

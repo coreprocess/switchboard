@@ -33,6 +33,8 @@ export const FAST: Partial<Timing> = {
     claimMs: 4_000,
     claimWaitMs: 8_000,
     waitTickMs: 100,
+    inputWaitMs: 1_000,
+    inputRetryMs: 50,
 };
 
 /** Polls until `check` holds (or fails after `timeoutMs`). */

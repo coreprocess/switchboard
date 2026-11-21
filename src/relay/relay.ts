@@ -294,9 +294,13 @@ export class Relay {
             case 'agent.mcp_tool_use':
                 turn.finalText = '';
                 return 'next';
-            case 'session.status_running':
+            case 'session.status_running': {
                 turn.settled = false;
+                // a turn that starts with a queued message has no "working…" message yet
+                const entry = await sb.sessions.get(sessionId);
+                if (entry?.state === 'active') await sb.sessions.ensureWorking(entry);
                 return 'next';
+            }
             case 'session.status_idle': {
                 const entry = await sb.sessions.get(sessionId);
                 if (!entry) return 'ended';

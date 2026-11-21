@@ -110,10 +110,8 @@ describe('recovery', () => {
         assert.ok(posted);
         const sessionId = [...h.claude.sessions.keys()].at(-1) ?? '';
         await eventually(() => h.claude.sessions.get(sessionId)?.session.status === 'idle');
-        // the platform refuses events for a terminated session: the click cannot be delivered
-        const session = h.claude.sessions.get(sessionId);
-        assert.ok(session);
-        session.session.status = 'terminated';
+        // the platform refuses the click's message; the session itself stays as it is, so nothing else touches the card
+        h.claude.refusing.add(sessionId);
         const click = await h.post(h.click(root.id, posted.id, 'go', { switchboard_card: cardId }), 1);
         assert.equal(click.body?.value, 'The agent could not be reached; please try again.');
         const card = await h.instances[0]?.sb.entities.cards.get(cardId);

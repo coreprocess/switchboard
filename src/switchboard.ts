@@ -43,6 +43,9 @@ export interface Timing {
     claimMs: number;
     claimWaitMs: number;
     waitTickMs: number;
+    /** How long a message is sent again to a session that is paused for results, and how often. */
+    inputWaitMs: number;
+    inputRetryMs: number;
     /** How often one pod checks that Switchboard may read the bound channels. */
     accessCheckMs: number;
 }
@@ -56,6 +59,8 @@ const DEFAULT_TIMING: Timing = {
     claimMs: 90_000,
     claimWaitMs: 30_000,
     waitTickMs: 10_000,
+    inputWaitMs: 8_000,
+    inputRetryMs: 500,
     accessCheckMs: 15 * 60_000,
 };
 

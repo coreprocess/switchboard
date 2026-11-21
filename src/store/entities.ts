@@ -137,8 +137,6 @@ export const SessionSchema = z.object({
     stopping: optional,
     createdAt: z.string(),
     lastActivity: z.string(),
-    /** When Switchboard last sent the session input (messages, clicks, confirmations); waits compare with it. */
-    lastInputAt: optional,
 });
 export type SessionEntry = z.infer<typeof SessionSchema>;
 

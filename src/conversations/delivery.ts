@@ -13,6 +13,7 @@ import {
     sessionMessageHeader,
 } from '../core/text.ts';
 import { sleep, timeOfMessageId } from '../core/time.ts';
+import { SessionPausedError } from '../sessions/sessions.ts';
 import { type Binding, type Conversation, conversationKey, type SessionEntry } from '../store/entities.ts';
 import type { Switchboard } from '../switchboard.ts';
 import { channelOf, titleOf } from './conversations.ts';
@@ -57,6 +58,10 @@ interface FirstMessage {
     files: FileResource[];
 }
 
+const PAUSED_NOTE =
+    '⚠️ The agent is waiting for a confirmation or a tool result and could not take this message. Please send it ' +
+    'again afterwards.';
+
 const textBlock = (text: string): ContentBlock => ({ type: 'text', text });
 
 export class Delivery {
@@ -90,12 +95,17 @@ export class Delivery {
             (a) => `[attachment not supported] name=${a.name} type=${a.mediaType}`
         );
         const text = [message.text, ...rejected].filter(Boolean).join('\n');
-        await this.#deliver(binding, rootId, {
-            messageId: message.messageId,
-            at: message.at,
-            text: formatHumanMessage(message.from, message.at, text),
-            images: attachments.blocks,
-        });
+        try {
+            await this.#deliver(binding, rootId, {
+                messageId: message.messageId,
+                at: message.at,
+                text: formatHumanMessage(message.from, message.at, text),
+                images: attachments.blocks,
+            });
+        } catch (error) {
+            if (!(error instanceof SessionPausedError)) throw error;
+            await this.#note(binding, rootId, PAUSED_NOTE);
+        }
     }
 
     /**

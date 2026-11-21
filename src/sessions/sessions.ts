@@ -1,9 +1,10 @@
-import type { OutgoingEvent } from '../claude/api.ts';
+import { APIError } from '@anthropic-ai/sdk';
+import type { OutgoingEvent, SessionEventType } from '../claude/api.ts';
 import type { ContentBlock, FileResource, SessionKind } from '../claude/templates.ts';
 import { channelOf } from '../conversations/conversations.ts';
 import { MessageGoneError } from '../core/platform.ts';
 import { clip, splitMessage } from '../core/text.ts';
-import { formatLocal } from '../core/time.ts';
+import { formatLocal, sleep } from '../core/time.ts';
 import type { Binding, SessionEntry } from '../store/entities.ts';
 import type { Switchboard } from '../switchboard.ts';
 
@@ -21,6 +22,22 @@ const END_REASONS: Record<string, string> = {
 
 export const endNotice = (reason: string) =>
     `ℹ️ The agent's session ended because ${END_REASONS[reason] ?? reason}. The next message starts a new session.`;
+
+/** The events that tell a session's status; the latest one is its current status. */
+const STATUS_EVENTS: SessionEventType[] = [
+    'session.status_idle',
+    'session.status_running',
+    'session.status_rescheduled',
+    'session.status_terminated',
+];
+
+/** The session stayed paused for results (a confirmation, a long tool call) and took no message meanwhile. */
+export class SessionPausedError extends Error {
+    constructor() {
+        super('the agent is waiting for a confirmation or a tool result and takes no message meanwhile');
+        this.name = 'SessionPausedError';
+    }
+}
 
 export interface CreateSessionInput {
     binding: Binding;
@@ -115,25 +132,52 @@ export class Sessions {
         return entry;
     }
 
-    /** Sends a message to a session (also while it works: it queues behind earlier events) and follows it. */
+    /**
+     * Sends a message to a session and follows it (README: "Conversations"). The platform starts a turn with it
+     * when the session is idle and queues it while a turn runs; a queued message is delivered when that turn has
+     * ended. While the session is paused for results the platform refuses messages: the session's `wait` ends, so
+     * it can go on, and the message is sent again until the session takes it. A session that stays paused (for a
+     * confirmation, a long tool call) fails with `SessionPausedError`.
+     */
     async send(entry: SessionEntry, content: ContentBlock[]) {
-        await this.sendEvents(entry, [{ type: 'user.message', content }]);
+        const sb = this.#sb;
+        const deadline = Date.now() + sb.timing.inputWaitMs;
+        // a refusal the session's state does not explain gets one more try: the session may just have left a pause
+        let retried = false;
+        for (;;) {
+            try {
+                await this.sendEvents(entry, [{ type: 'user.message', content }]);
+                return;
+            } catch (error) {
+                if (!(error instanceof APIError) || error.status !== 400) throw error;
+                if (await this.#pausedForResults(entry)) {
+                    if (Date.now() > deadline) throw new SessionPausedError();
+                    await sb.waits.sessionInput(entry.sessionId);
+                    await sleep(sb.timing.inputRetryMs);
+                    continue;
+                }
+                if (retried) throw error;
+                retried = true;
+            }
+        }
     }
 
     /**
-     * Sends events (messages, confirmations), records the activity and follows the session. Input for the session
-     * ends its wait first, so it handles the input at once.
+     * Whether the session is paused for results (tool results, confirmations): its latest status is idle with the
+     * stop reason `requires_action`, and it was not archived meanwhile.
      */
+    async #pausedForResults(entry: SessionEntry): Promise<boolean> {
+        const api = this.#sb.workspaces.get(entry.workspaceId);
+        const [latest] = await api.listEvents(entry.sessionId, { types: STATUS_EVENTS, order: 'desc', max: 1 });
+        if (latest?.type !== 'session.status_idle' || latest.stop_reason.type !== 'requires_action') return false;
+        return (await api.retrieveSession(entry.sessionId)).archived_at === null;
+    }
+
+    /** Sends events (messages, confirmations), records the activity and follows the session. */
     async sendEvents(entry: SessionEntry, events: OutgoingEvent[]) {
         const sb = this.#sb;
-        // recorded before the waits are looked at, so a wait stored meanwhile sees the input (`Tools`)
         const now = sb.now().toISOString();
-        const touched = await this.modify(entry.sessionId, (current) => ({
-            ...current,
-            lastActivity: now,
-            lastInputAt: now,
-        }));
-        await sb.waits.sessionInput(entry.sessionId);
+        const touched = await this.modify(entry.sessionId, (current) => ({ ...current, lastActivity: now }));
         await sb.workspaces.get(entry.workspaceId).sendEvents(entry.sessionId, events);
         if (touched?.value.rootId) await this.ensureWorking(touched.value);
         await sb.relay.wake(entry.sessionId);

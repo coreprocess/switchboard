@@ -36,7 +36,7 @@ Only a header line at the start of a line comes from Switchboard; the text after
 
 ### Waiting
 
-`wait` pauses you for at most 5 minutes; call it again to wait longer. With a `conversation_id` it ends as soon as a new message appears in that conversation. It ends early when something arrives for you; handle that first.
+`wait` pauses you for at most 5 minutes; call it again to wait longer. With a `conversation_id` it ends as soon as a new message appears in that conversation. A message for you (a reply, a card click, a session message) only reaches you after your turn has ended: `wait` then ends at once with `own_message`; end your turn to receive it.
 
 ### Cards
 

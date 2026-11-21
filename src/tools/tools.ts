@@ -63,7 +63,7 @@ export class Tools {
                 waitWatch: reply.wait.watch,
             });
             sb.log.info({ sessionId, until: reply.wait.until, watching: Boolean(reply.wait.watch) }, 'wait started');
-            await this.#inputBeforeWait(sessionId, event.processed_at);
+            await sb.waits.started(sessionId);
             return 'waiting';
         }
         const done: ToolCall = { ...inserted.value, status: 'done', result: reply.text, isError: reply.isError };
@@ -71,16 +71,6 @@ export class Tools {
         await this.deliver(done);
         sb.log.info({ sessionId, tool: event.name, error: reply.isError }, 'tool call answered');
         return 'answered';
-    }
-
-    /**
-     * Input that reached the session after it called `wait` but before the wait was stored found no wait to end:
-     * the wait ends now. Sessions record input (`lastInputAt`) before they look for waits, so one of the two sides
-     * always sees the other.
-     */
-    async #inputBeforeWait(sessionId: string, calledAt: string | null) {
-        const entry = await this.#sb.sessions.get(sessionId);
-        if (calledAt && (entry?.lastInputAt ?? '') > calledAt) await this.#sb.waits.sessionInput(sessionId);
     }
 
     /** A call seen before: its result is sent unless it reached the session already. */

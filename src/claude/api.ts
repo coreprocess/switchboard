@@ -22,6 +22,7 @@ export type AgentUpdate = AgentUpdateParams;
 export type DeploymentUpdate = DeploymentUpdateParams;
 export type Session = BetaManagedAgentsSession;
 export type SessionEvent = BetaManagedAgentsSessionEvent;
+export type SessionEventType = BetaManagedAgentsSessionEventType;
 export type StreamEvent = BetaManagedAgentsStreamSessionEvents;
 export type WebhookEvent = BetaWebhookEvent;
 export type CreateSessionParams = SessionCreateParams;
@@ -35,7 +36,7 @@ export type OutgoingEvent =
 export interface ListEventsOptions {
     /** Only events processed at or after this time (ISO 8601). */
     processedAtGte?: string;
-    types?: BetaManagedAgentsSessionEventType[];
+    types?: SessionEventType[];
     order?: 'asc' | 'desc';
     /** Stop after this many events. */
     max?: number;

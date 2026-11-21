@@ -26,7 +26,8 @@ interface MockSession {
     session: Json;
     events: Json[];
     streams: Set<Response>;
-    queue: Json[][];
+    /** `user.message` events not yet handled: the one(s) starting the next turn. */
+    queue: Json[];
     running: boolean;
     turnState?: { interrupted: boolean; stopped: boolean };
     waiting: Map<string, (value: Json) => void>;
@@ -55,6 +56,10 @@ const textOf = (content: Json[]) =>
 /**
  * A stand-in for the Managed Agents API: deployments, agents (with versions), sessions created with initial
  * events, events (list, send, SSE stream), archive, delete and files. The agent's turns are scripted with `agent`.
+ *
+ * Messages behave as on the platform: an idle session starts a turn with one; while a turn runs it is queued
+ * (listed without `processed_at`) and handled when that turn has ended; while the session is paused for results
+ * it is refused.
  */
 export class MockClaude {
     readonly sessions = new Map<string, MockSession>();
@@ -67,6 +72,8 @@ export class MockClaude {
     /** Agent versions saved and deployments changed through the API (`POST /v1/agents/:id`, `/v1/deployments/:id`). */
     readonly agentUpdates: Json[] = [];
     readonly deploymentUpdates: Json[] = [];
+    /** Sessions that refuse every event sent to them (as the platform does for a bad request). */
+    readonly refusing = new Set<string>();
     /** The agent: runs once per turn. The default answers "Echo: <last line>". */
     agent: (turn: Turn) => Promise<void> = async (turn) => {
         turn.say(`Echo: ${turn.text.split('\n').at(-1)}`);
@@ -124,9 +131,15 @@ export class MockClaude {
 
     /** Appends an event (with ID and time) and pushes it to open streams. */
     emit(sessionId: string, event: Json): Json {
+        return this.#processed(sessionId, { id: `sevt_${this.#next++}`, ...event });
+    }
+
+    /** The event takes its place among the processed ones (a queued message: when its turn starts). */
+    #processed(sessionId: string, event: Json): Json {
         const session = this.sessions.get(sessionId);
         if (!session) throw new Error(`no session ${sessionId}`);
-        const full: Json = { id: `sevt_${this.#next++}`, processed_at: new Date().toISOString(), ...event };
+        const full: Json = { processed_at: new Date().toISOString(), ...event };
+        session.events = session.events.filter((known) => known.id !== full.id);
         session.events.push(full);
         if (event.type === 'session.status_running') session.session.status = 'running';
         if (event.type === 'session.status_idle') session.session.status = 'idle';
@@ -148,11 +161,15 @@ export class MockClaude {
         this.emit(sessionId, { type: 'session.status_terminated' });
     }
 
-    #enqueue(id: string, content: Json[]) {
+    /** A message arrives: it starts a turn, or waits in the queue (unprocessed) while one runs. */
+    #receive(id: string, message: Json): Json {
         const session = this.sessions.get(id);
-        if (!session) return;
-        session.queue.push(content);
+        if (!session) throw new Error(`no session ${id}`);
+        const event: Json = { id: `sevt_${this.#next++}`, ...message };
+        session.events.push(event);
+        session.queue.push(event);
         if (!session.running) void this.#runTurns(id);
+        return event;
     }
 
     async #runTurns(id: string) {
@@ -160,9 +177,10 @@ export class MockClaude {
         if (!session || session.running) return;
         session.running = true;
         while (session.queue.length > 0 && session.session.status !== 'terminated') {
-            const batch = session.queue.splice(0, session.queue.length);
+            const batch = session.queue.splice(0, session.queue.length).map((message) => message.content as Json[]);
             const state = { interrupted: false, stopped: false };
             session.turnState = state;
+            for (const message of session.events.filter((event) => !event.processed_at)) this.#processed(id, message);
             this.emit(id, { type: 'session.status_running' });
             const idle = (stop: Json) => {
                 if (state.stopped) return;
@@ -293,11 +311,11 @@ export class MockClaude {
             const messages = initial.filter((e) => e.type === 'user.message');
             if (messages.length > 0) {
                 const created = this.sessions.get(id);
-                if (created) created.session.status = 'running';
-                this.#enqueue(
-                    id,
-                    messages.flatMap((e) => e.content as Json[])
-                );
+                if (created) {
+                    created.session.status = 'running';
+                    created.queue.push({ content: messages.flatMap((e) => e.content as Json[]) });
+                }
+                void this.#runTurns(id);
             }
             res.json(this.sessions.get(id)?.session);
         });
@@ -330,7 +348,12 @@ export class MockClaude {
         app.get('/v1/sessions/:id/events', (req, res) => {
             const found = session(req.params.id);
             if (!found) return void res.status(404).end();
-            let data = [...found.events];
+            const types = [req.query.types ?? req.query['types[]'] ?? []].flat().map(String);
+            // ordered by processing time; queued messages have none yet and come last
+            let data = [
+                ...found.events.filter((event) => event.processed_at),
+                ...found.events.filter((event) => !event.processed_at),
+            ].filter((event) => types.length === 0 || types.includes(String(event.type)));
             if (req.query.order === 'desc') data = data.reverse();
             const limit = req.query.limit ? Number(req.query.limit) : data.length;
             res.json({ data: data.slice(0, Math.max(limit, data.length)), next_page: null });
@@ -340,10 +363,22 @@ export class MockClaude {
             const found = session(id);
             if (!found) return void error(res, 404, 'session not found');
             if (found.session.status === 'terminated') return void error(res, 400, 'session is terminated');
-            const sent = ((req.body as { events: Json[] }).events ?? []).map((event) => this.emit(id, { ...event }));
+            if (this.refusing.has(id)) return void error(res, 400, 'the session takes no events');
+            const events = (req.body as { events: Json[] }).events ?? [];
+            if (found.waiting.size > 0 && events.some((event) => event.type === 'user.message')) {
+                return void error(
+                    res,
+                    400,
+                    `Invalid user.message event at events[0]: waiting on responses to events [${[...found.waiting.keys()].join(', ')}]; ` +
+                        'only `user.tool_confirmation`, `user.custom_tool_result`, `user.tool_result`, or ' +
+                        '`user.interrupt` may be sent'
+                );
+            }
+            const sent = events.map((event) =>
+                event.type === 'user.message' ? this.#receive(id, { ...event }) : this.emit(id, { ...event })
+            );
             res.json({ data: sent });
             for (const event of sent) {
-                if (event.type === 'user.message') this.#enqueue(id, event.content as Json[]);
                 if (event.type === 'user.custom_tool_result')
                     found.waiting.get(String(event.custom_tool_use_id))?.(event);
                 if (event.type === 'user.tool_confirmation') found.waiting.get(String(event.tool_use_id))?.(event);

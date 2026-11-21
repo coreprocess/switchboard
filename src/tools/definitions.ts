@@ -196,9 +196,9 @@ const definitions: Record<ToolName, BetaManagedAgentsCustomToolParams> = {
         description:
             `Pauses your session for \`minutes\` (at most ${MAX_WAIT_MINUTES}; call it again to wait longer). With ` +
             '`conversation_id` (another conversation of your channel) it ends as soon as a new message appears ' +
-            'there. It ends early when something arrives for you (a reply in your thread, a card click, a session ' +
-            'message); handle that first. Returns `reason`: `timeout`, `conversation_message` (with the message in ' +
-            'brief) or `own_message`.',
+            'there. A message for you (a reply in your thread, a card click, a session message) only reaches you ' +
+            'after your turn has ended: the wait then ends at once with `own_message`; end your turn to receive ' +
+            'it. Returns `reason`: `timeout`, `conversation_message` (with the message in brief) or `own_message`.',
         input_schema: {
             type: 'object',
             properties: {

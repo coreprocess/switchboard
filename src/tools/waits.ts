@@ -4,13 +4,25 @@ import type { Query } from '../store/store.ts';
 import type { Switchboard } from '../switchboard.ts';
 
 /**
- * The `wait` tool (README: "Conversations across the channel"): a session pauses until its deadline, a new message in a conversation it
- * watches, or something for itself. A waiting call is a stored tool call with status `waiting`; the session holds
- * no lease meanwhile. Every pod's timer answers due waits, and the pod that sees a message answers the waits on
- * its conversation. Each wait is answered once: the change from `waiting` to `done` is a conditional write.
+ * The `wait` tool (README: "Conversations across the channel"): a session pauses until its deadline, a new message
+ * in a conversation it watches, or a message for itself. A waiting call is a stored tool call with status
+ * `waiting`; the session holds no lease meanwhile. Every pod's timer answers due waits, and the pod that sees a
+ * message answers the waits on its conversation. Each wait is answered once: the change from `waiting` to `done`
+ * is a conditional write.
+ *
+ * A session only receives a message for itself after its turn has ended, so a wait never pauses over one. The
+ * platform decides which of two cases applies: it queues a message that arrives while the turn runs (the wait
+ * ends when it starts, `started`), and it refuses one that arrives while the session is paused in the wait (the
+ * sender ends the wait and sends again, `Sessions.send`).
  */
 
 export const MAX_WAIT_MINUTES = 5;
+
+/** The newest messages of a session looked at for a queued one. */
+const QUEUED_MESSAGES_SCAN = 20;
+
+/** Tells a waiting agent how to get its message; sessions created before a prompt change get it this way too. */
+export const OWN_MESSAGE_HINT = 'A message for you is waiting. End your turn to receive it.';
 
 /** A message as a waiting session learns about it, in brief. */
 export interface SeenMessage {
@@ -21,7 +33,7 @@ export interface SeenMessage {
 
 type WaitResult =
     | { reason: 'timeout' }
-    | { reason: 'own_message' }
+    | { reason: 'own_message'; hint: string }
     | { reason: 'conversation_message'; conversation_id: string; message: SeenMessage };
 
 export class Waits {
@@ -73,9 +85,23 @@ export class Waits {
         );
     }
 
-    /** Something arrives for the session itself (a reply, a click, a session message): its wait ends first. */
+    /** A message for the session itself (a reply, a click, a session message): its wait ends. */
     async sessionInput(sessionId: string) {
-        await this.#endWaits({ partitionKey: sessionId }, { reason: 'own_message' });
+        await this.#endWaits({ partitionKey: sessionId }, { reason: 'own_message', hint: OWN_MESSAGE_HINT });
+    }
+
+    /** A wait was stored: it ends at once when the platform holds a queued message for the session. */
+    async started(sessionId: string) {
+        const sb = this.#sb;
+        const entry = await sb.sessions.get(sessionId);
+        if (!entry) return;
+        const messages = await sb.workspaces.get(entry.workspaceId).listEvents(sessionId, {
+            types: ['user.message'],
+            order: 'desc',
+            max: QUEUED_MESSAGES_SCAN,
+        });
+        // a queued message has no processing time yet
+        if (messages.some((message) => !message.processed_at)) await this.sessionInput(sessionId);
     }
 
     async #endWaits(query: Query, result: WaitResult) {

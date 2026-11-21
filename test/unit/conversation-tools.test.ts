@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
+import { WORKING_TEXT } from '../../src/sessions/sessions.ts';
+import { OWN_MESSAGE_HINT } from '../../src/tools/waits.ts';
 import {
     CHANNEL,
     eventually,
@@ -24,6 +26,8 @@ describe('conversation tools', () => {
     /** What the agent does when the last line of its input matches. */
     const scripts: [RegExp, (turn: Turn, match: RegExpExecArray) => Promise<void>][] = [];
     let jobPlan: ((turn: Turn) => Promise<void>) | undefined;
+    /** Lets a scripted turn go on. */
+    const release: { work?: () => void; hold?: () => void } = {};
     const script = (pattern: RegExp, run: (turn: Turn, match: RegExpExecArray) => Promise<void>) =>
         scripts.push([pattern, run]);
     const sessionOf = async (rootId: string) =>
@@ -63,6 +67,22 @@ describe('conversation tools', () => {
             }
             if (tool === 'wait') results[key] = await turn.callTool('wait', JSON.parse(id ?? '{}'));
             turn.say(`Done: ${tool}`);
+        });
+        script(/^work, then wait$/, async (turn) => {
+            await new Promise<void>((resolve) => {
+                release.work = resolve;
+            });
+            results.work = await turn.callTool('wait', { minutes: 1 });
+            turn.say('Done: work');
+        });
+        script(/^hold: (.+)$/, async (turn, [, text]) => {
+            await new Promise<void>((resolve) => {
+                release.hold = resolve;
+            });
+            turn.say(`Echo: ${text}`);
+        });
+        script(/^ask for a confirmation$/, async (turn) => {
+            turn.say(`Confirmed: ${await turn.askConfirmation('bash', { command: 'ls' })}`);
         });
     });
 
@@ -273,7 +293,8 @@ describe('conversation tools', () => {
         const created = h.claude.createRequests.length;
         await h.post(sender);
         await eventually(() => h.claude.createRequests.length === created + 2, 8000, 'target session created');
-        assert.ok(await sessionOf(legacy));
+        // the session is attached to the thread a moment after the platform created it
+        await eventually(async () => (await sessionOf(legacy)) !== '', 8000, 'target session attached');
         const first = h.firstText();
         assert.match(first, /^\[switchboard:continuation\] previous_session=none reason=first_session/);
         assert.match(first, /2026-10-01T08:00:00.000Z · person "Jane Doe" .*\n {4}Legacy incident notes/);
@@ -342,7 +363,7 @@ describe('conversation tools', () => {
         assert.ok(until - Date.now() <= 5 * 60_000 && until - Date.now() > 4 * 60_000, 'capped at 5 minutes');
         await h.post(h.message('Are you there?', { rootId: capped.id }));
         await eventually(() => h.thread(capped.id).includes('Echo: Are you there?'), 8000, 'reply handled');
-        assert.deepEqual(json(results['wait:{"minutes":60}:']), { reason: 'own_message' });
+        assert.deepEqual(json(results['wait:{"minutes":60}:']), { reason: 'own_message', hint: OWN_MESSAGE_HINT });
 
         const ownRoot = h.message('placeholder');
         const self = { ...ownRoot, text: `wait {"minutes":1,"conversation_id":"${ownRoot.id}"}` };
@@ -352,31 +373,55 @@ describe('conversation tools', () => {
         await sleep(50);
     });
 
-    it('ends a wait at once when input arrived after the call but before the wait was stored', async () => {
+    it('ends a wait at once when a message was queued while the turn ran', async () => {
+        const root = h.message('work, then wait');
+        await h.post(root);
+        await eventually(async () => (await sessionOf(root.id)) !== '');
+        const sessionId = await sessionOf(root.id);
+        await eventually(() => h.claude.sessions.get(sessionId)?.session.status === 'running');
+        await h.post(h.message('hold: Queued question', { rootId: root.id }));
+        const queued = () => h.claude.sessions.get(sessionId)?.events.filter((e) => !e.processed_at) ?? [];
+        assert.equal(queued().length, 1, 'the platform queues a message that arrives during a turn');
+        const started = Date.now();
+        release.work?.();
+        await eventually(() => h.thread(root.id).includes('Done: work'));
+        assert.deepEqual(json(results.work), { reason: 'own_message', hint: OWN_MESSAGE_HINT });
+        assert.ok(Date.now() - started < 3_000, 'the wait did not run to its deadline');
+        // the queued message starts the next turn, which shows that the agent works
+        await eventually(() => h.thread(root.id).includes(WORKING_TEXT), 8000, 'working shown for the queued turn');
+        assert.equal(queued().length, 0);
+        release.hold?.();
+        await eventually(() => h.thread(root.id).includes('Echo: Queued question'), 8000, 'queued message handled');
+        assert.ok(!h.thread(root.id).includes(WORKING_TEXT));
+    });
+
+    it('reports a message a session could not take while it stayed paused for a confirmation', async () => {
         const sb = h.instances[0]?.sb;
         assert.ok(sb);
-        const root = h.message('race');
+        const root = h.message('ask for a confirmation');
         await h.post(root);
-        await eventually(() => h.thread(root.id).includes('Echo: race'));
+        await eventually(async () => (await sessionOf(root.id)) !== '');
         const sessionId = await sessionOf(root.id);
-        const event = h.claude.emit(sessionId, { type: 'agent.custom_tool_use', name: 'wait', input: { minutes: 1 } });
-        const calledAt = String(event.processed_at);
-        await sb.sessions.modify(sessionId, (current) => ({
-            ...current,
-            lastInputAt: new Date(Date.parse(calledAt) + 1_000).toISOString(),
-        }));
-        const state = await sb.tools.handle(sessionId, {
-            ...event,
-            type: 'agent.custom_tool_use' as const,
-            id: String(event.id),
-            name: 'wait',
-            input: { minutes: 1 },
-            processed_at: calledAt,
-        });
-        assert.equal(state, 'waiting');
-        const stored = await sb.entities.toolCalls.get(sessionId, String(event.id));
-        assert.equal(stored?.value.status, 'done');
-        assert.deepEqual(JSON.parse(stored?.value.result ?? '{}'), { reason: 'own_message' });
+        await eventually(() => (h.claude.sessions.get(sessionId)?.waiting.size ?? 0) > 0, 8000, 'paused');
+        const before = h.claude.userMessages(sessionId).length;
+
+        await h.post(h.message('Can you hear me?', { rootId: root.id }));
+        await eventually(() => h.thread(root.id).some((text) => text.startsWith('⚠️ The agent is waiting for a')));
+        assert.equal(h.claude.userMessages(sessionId).length, before, 'the paused session took no message');
+
+        const sender = h.message(`send ${root.id} news from another thread`);
+        await h.post(sender);
+        await eventually(() => h.thread(sender.id).includes('Done: send'));
+        assert.equal(json(results[`send:${root.id}:news from another thread`]).delivered, false);
+        assert.ok(h.thread(root.id).some((text) => text.startsWith('⚠️ The message above could not be passed')));
+
+        const confirm = [...(h.claude.sessions.get(sessionId)?.waiting.keys() ?? [])][0];
+        await sb.workspaces
+            .get(WORKSPACE)
+            .sendEvents(sessionId, [{ type: 'user.tool_confirmation', tool_use_id: String(confirm), result: 'allow' }]);
+        await eventually(() => h.thread(root.id).includes('Confirmed: allow'));
+        await h.post(h.message('And now?', { rootId: root.id }));
+        await eventually(() => h.thread(root.id).includes('Echo: And now?'));
     });
 
     it('works without Graph: continuations start without history, the tools report an error', async () => {
